@@ -402,3 +402,95 @@ async fn custom_headers_applied() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn streamed_retry_does_not_accumulate() {
+    // 无 Range + 首次 GET 500 → 流式重试成功后文件不叠加
+    let server = MockServer::start(
+        512 * 1024,
+        Behavior { no_range: true, flaky: Some(1), ..Default::default() },
+    )
+    .await;
+    let dir = tmp_dir("stream-retry");
+    let dest = dir.join("sr.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let id = m.add(DownloadTask::new(server.url("flaky"), dest.clone()));
+    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await, TaskState::Completed);
+    let got = std::fs::read(&dest).unwrap();
+    assert_eq!(got.len(), server.data.len(), "流式重试后文件不应叠加（大小必须一致）");
+    assert_eq!(got, *server.data, "流式重试后内容不一致");
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn retry_after_failure_recovers() {
+    // 前 5 次 GET 失败 + 禁止自动重试 → 任务 Failed → retry 直到服务器恢复 → Completed
+    let server = MockServer::start(256 * 1024, Behavior { flaky: Some(5), ..Default::default() }).await;
+    let dir = tmp_dir("retry");
+    let dest = dir.join("r.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let id = m.add(
+        DownloadTask::new(server.url("flaky"), dest.clone()).with_max_retries(0),
+    );
+    assert_eq!(wait_state(&m, id, TaskState::Failed, Duration::from_secs(20)).await, TaskState::Failed);
+    assert!(server.flaky_requests() >= 2, "失败任务应至少经历 2 次 GET（段 + 降级流式）");
+
+    m.retry(id).await.unwrap();
+    assert_eq!(m.state(id).await.unwrap(), TaskState::Queued);
+    // 服务器前 5 次 GET 失败；失败阶段已消耗 2 次，需 retry 若干次直到恢复
+    let mut recovered = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(10)).await;
+        if st == TaskState::Completed {
+            recovered = true;
+            break;
+        }
+        if st == TaskState::Failed {
+            m.retry(id).await.unwrap();
+        } else {
+            panic!("retry 后出现意外状态 {st:?}");
+        }
+    }
+    assert!(recovered, "retry 后应最终恢复完成");
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "retry 后内容不一致");
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sha256_verifies_content() {
+    use sha2::{Digest, Sha256};
+    let server = MockServer::start(512 * 1024, Behavior::default()).await;
+    let digest: [u8; 32] = Sha256::digest(&server.data[..]).into();
+    let dir = tmp_dir("sha-ok");
+    let dest = dir.join("s.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()).with_sha256(digest));
+    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await, TaskState::Completed);
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sha256_mismatch_fails_after_redownload() {
+    let server = MockServer::start(256 * 1024, Behavior::default()).await;
+    let dir = tmp_dir("sha-bad");
+    let dest = dir.join("sbad.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let mut rx = m.subscribe();
+    let wrong = [0xABu8; 32];
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()).with_sha256(wrong));
+    assert_eq!(wait_state(&m, id, TaskState::Failed, Duration::from_secs(30)).await, TaskState::Failed);
+    assert!(!dest.exists(), "校验失败不应留下目标文件");
+    assert!(!dest.with_file_name("sbad.bin.part").exists(), "校验失败应清理 .part");
+    let events = drain_events(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("SHA-256"))),
+        "应产生 SHA-256 重下日志"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

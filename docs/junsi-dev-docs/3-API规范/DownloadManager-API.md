@@ -105,3 +105,36 @@ Log { level: LogLevel, message }                                   // Debug/Info
 ## 修订记录
 | 日期 | 版本 | 修改内容 | 修改人 |
 | 2026-08-06 | v1.0 | 初版创建 | AI Agent |
+
+### 2026-08-07 更新
+### `DownloadTask`（builder）
+```rust
+DownloadTask::new(url, dest)
+    .with_header(name, value)      // 任务级头（覆盖全局）
+    .with_mirrors([urls])          // 镜像 URL（探测失败/重试耗尽时轮换）
+    .with_max_segments(n)
+    .with_max_retries(n)
+    .with_segment_size(n)
+    .with_sha256([u8; 32])         // SHA-256 校验和（原始字节）
+    .with_sha256_hex("64位hex")    // SHA-256 校验和（hex，无效忽略）
+```
+
+## `DownloadManager` API
+
+| 方法 | 签名 | 说明 |
+|------|------|------|
+| `new` | `(DownloadOptions, max_concurrent: usize)` | 全局并发任务数上限 |
+| `subscribe` | `() -> broadcast::Receiver<DownloadEvent>` | 订阅三级进度事件 |
+| `add` | `(DownloadTask) -> TaskId` | 入队（同步返回，有空位立即启动） |
+| `pause` | `async (id) -> Result<()>` | 暂停（.part 保留） |
+| `resume` | `async (id) -> Result<()>` | 恢复（并发满则排队） |
+| `retry` | `async (id) -> Result<()>` | 重试 Failed/Cancelled 任务（.part 保留则续传） |
+| `cancel` | `async (id) -> Result<()>` | 取消（删除 .part） |
+| `remove` | `async (id) -> Result<()>` | 取消并清理条目 |
+| `state` | `async (id) -> Result<TaskState>` | 查询状态 |
+| `list` | `async () -> Vec<(TaskId, TaskState)>` | 任务列表 |
+| `shutdown` | `async ()` | 取消全部任务并等待退出 |
+
+## 错误（`DownloadError`）
+
+`Http` / `HttpStatus{status,url}` / `Io` / `TaskNotFound` / `Cancelled` / `Incomplete{expected,actual}` / `ChecksumMismatch{expected,actual}` / `Exhausted` / `Other`

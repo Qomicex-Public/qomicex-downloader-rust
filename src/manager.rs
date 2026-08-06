@@ -152,6 +152,31 @@ impl DownloadManager {
         Ok(())
     }
 
+    /// 重试失败/取消的任务（`.part` 保留则断点续传，否则从头下载）。
+    pub async fn retry(&self, id: TaskId) -> Result<(), DownloadError> {
+        let entry = self.entry(id)?;
+        {
+            let mut st = entry.state.write().unwrap();
+            match *st {
+                TaskState::Failed | TaskState::Cancelled => {}
+                TaskState::Downloading | TaskState::Queued => {
+                    return Err(DownloadError::Other("任务进行中，无法重试".into()));
+                }
+                TaskState::Completed => {
+                    return Err(DownloadError::Other("任务已完成，无需重试".into()));
+                }
+                TaskState::Paused => {
+                    return Err(DownloadError::Other("任务已暂停，请用 resume".into()));
+                }
+            }
+            *st = TaskState::Queued;
+        }
+        *entry.cancel.lock().await = CancellationToken::new();
+        self.inner.queue.lock().unwrap().push_back(id);
+        self.inner.dispatch.notify_one();
+        Ok(())
+    }
+
     /// 取消任务（删除 `.part`，不可恢复）。
     pub async fn cancel(&self, id: TaskId) -> Result<(), DownloadError> {
         let entry = self.entry(id)?;

@@ -132,6 +132,8 @@ pub struct DownloadTask {
     pub max_retries: Option<u32>,
     /// 覆盖 `DownloadOptions::segment_size`。
     pub segment_size: Option<u64>,
+    /// 可选 SHA-256 校验和（下载完成后验证，不匹配自动重下一次）。
+    pub sha256: Option<[u8; 32]>,
     /// 内部任务 ID（由 manager 分配）。
     pub(crate) id: TaskId,
 }
@@ -147,6 +149,7 @@ impl DownloadTask {
             max_segments: None,
             max_retries: None,
             segment_size: None,
+            sha256: None,
             id: 0,
         }
     }
@@ -181,6 +184,18 @@ impl DownloadTask {
         self
     }
 
+    /// 设置 SHA-256 校验和（原始字节）。
+    pub fn with_sha256(mut self, digest: [u8; 32]) -> Self {
+        self.sha256 = Some(digest);
+        self
+    }
+
+    /// 设置 SHA-256 校验和（64 位十六进制字符串，无效则忽略）。
+    pub fn with_sha256_hex(mut self, hex: &str) -> Self {
+        self.sha256 = parse_hex_sha256(hex);
+        self
+    }
+
     /// `.part` 中间文件路径（与目标同目录，文件名追加 `.part`）。
     pub(crate) fn part_path(&self) -> PathBuf {
         let name = self
@@ -190,4 +205,19 @@ impl DownloadTask {
             .unwrap_or_else(|| "download".to_string());
         self.dest.with_file_name(format!("{name}.part"))
     }
+}
+
+/// 解析 64 字符十六进制 SHA-256（无效返回 None）。
+pub(crate) fn parse_hex_sha256(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
 }

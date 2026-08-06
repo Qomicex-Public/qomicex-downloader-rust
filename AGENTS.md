@@ -22,3 +22,9 @@ cargo doc --no-deps        # 文档
 - 关键决策 → 追加 `.memory/decisions/`（gitignored）
 - 测试依赖 `tests/common/mod.rs` 的 mock HTTP 服务器（支持 Range/flaky/stall/throttle 注入），新用例复用之
 - Windows 特有坑：只读句柄 `sync_all` 返回 ACCESS_DENIED（finalize 必须用读写句柄）；rename 目标存在需先删
+
+## 依赖（2026-08-07 更新）
+
+- 主依赖：tokio / reqwest(rustls) / futures-util / thiserror / rand / tokio-util / **sha2**（SHA-256 校验）
+- dev 依赖：sha2（测试计算校验和）
+- 依赖变更须同步更新本清单与 Cargo.toml

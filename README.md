@@ -14,6 +14,8 @@
 | 自动重试 | 分片级指数退避 + 随机抖动；耗尽后镜像轮换、降级整文件流式重下 |
 | 看门狗 | 无数据超时 / 持续龟速（低于平滑速度 ×0.3）自动重建段 |
 | 断点续传 | `.part` 中间文件 + 段边界对齐，暂停后无缝续传 |
+| 完整性校验 | 可选 SHA-256（with_sha256），失败自动重下；流式 EOF 字节数校验 |
+| 失败重试 | 任务级 `retry(id)`，Failed/Cancelled 一键重试（续传） |
 | 原子完成 | fsync + rename，杜绝半成品文件 |
 | 三级进度 | 任务级 / 全局聚合 / 日志事件，节流上报，适配 Tauri IPC |
 | 自定义请求头 | 全局默认 + 任务级覆盖（UA / Authorization 等） |
@@ -63,13 +65,14 @@ let manager = DownloadManager::new(DownloadOptions::default(), max_concurrent);
 manager.add(task)          // 入队，返回 TaskId（同步）
 manager.pause(id).await    // 暂停（.part 保留）
 manager.resume(id).await   // 恢复（并发满则排队）
+manager.retry(id).await    // 重试 Failed/Cancelled 任务（续传）
 manager.cancel(id).await   // 取消（删除 .part）
 manager.state(id).await    // 查询状态
 manager.list().await       // 任务列表
 manager.shutdown().await   // 优雅关闭
 ```
 
-任务状态机：`Queued → Downloading → Completed / Paused ⇄ Downloading / Failed / Cancelled`
+任务状态机：`Queued → Downloading → Completed / Paused ⇄ Downloading / Failed / Cancelled`（`Failed/Cancelled → retry → Queued`）
 
 事件（`broadcast` 通道，容量 1024）：
 - `Progress`：任务级，150ms 节流，含速度 / 活跃段数
@@ -93,17 +96,16 @@ cargo clippy --all-targets # lint（保持 0 警告）
 cargo doc --no-deps        # 文档
 ```
 
-测试覆盖：多段并发 / 小文件直传 / 无 Range 回退流式 / chunked / 分片失败重试 / 404 / 暂停续传 / 取消清理 / 队列并发上限 / 看门狗段重建 / 动态拆分 / 全局进度 / 镜像回退 / 自定义请求头（基于 `tests/common/mod.rs` 的 mock HTTP 服务器，支持 Range / flaky / stall / throttle 注入）。
+测试覆盖：多段并发 / 小文件直传 / 无 Range 回退流式 / chunked / 分片失败重试 / 流式重试防叠加 / 404 / 暂停续传 / 取消清理 / 队列并发上限 / 看门狗段重建 / 动态拆分 / 全局进度 / 镜像回退 / 自定义请求头 / retry 恢复 / SHA-256 通过+失败（基于 `tests/common/mod.rs` 的 mock HTTP 服务器，支持 Range / flaky / stall / throttle 注入）。
 
 ## 平台注意
 
 - **Windows**：只读句柄 `sync_all` 返回 ACCESS_DENIED（finalize 必须用读写句柄）；rename 目标存在需先删
-- **Android**：纯 Rust 依赖栈，需 NDK 交叉编译（详见 Android 平台支持文档）
+- **Android**：纯 Rust 依赖栈（rustls + sha2），需 NDK 交叉编译（详见 Android 平台支持文档）
 
 ## 路线图
 
 - [ ] 智能镜像选择：DNS 解析 → IP 粒度 EMA 测速 → 最优节点直连（需自定义 hyper connector）
-- [ ] SHA-256 完整性校验
 - [ ] 限速 / 调度策略
 
 ## License

@@ -29,6 +29,10 @@ pub enum DownloadError {
     #[error("下载数据不完整: 期望 {expected} 字节, 实际 {actual} 字节")]
     Incomplete { expected: u64, actual: u64 },
 
+    /// SHA-256 校验失败（自动重下一次后仍失败）。
+    #[error("SHA-256 校验失败: 期望 {expected}, 实际 {actual}")]
+    ChecksumMismatch { expected: String, actual: String },
+
     /// 所有重试/镜像均已耗尽。
     #[error("所有重试均已耗尽: {0}")]
     Exhausted(String),

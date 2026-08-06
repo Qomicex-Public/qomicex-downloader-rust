@@ -91,6 +91,27 @@ impl Engine {
     }
 
     pub(crate) async fn run(&self, ctx: &Arc<RunContext>) -> Result<(), DownloadError> {
+        let mut attempts = 0;
+        loop {
+            let result = self.run_once(ctx).await;
+            if let Err(DownloadError::ChecksumMismatch { .. }) = result {
+                // 校验失败的文件内容不可信：始终清理 .part（重下前 + 最终失败）
+                let part = ctx.task.part_path();
+                let _ = tokio::fs::remove_file(&part).await;
+                if attempts == 0 {
+                    attempts += 1;
+                    ctx.log(
+                        LogLevel::Warn,
+                        "SHA-256 校验失败，删除 .part 自动重下".to_string(),
+                    );
+                    continue;
+                }
+            }
+            return result;
+        }
+    }
+
+    async fn run_once(&self, ctx: &Arc<RunContext>) -> Result<(), DownloadError> {
         let part = ctx.task.part_path();
         let probe = self.probe(ctx).await?;
         ctx.log(
@@ -321,7 +342,7 @@ impl Engine {
         if actual != total {
             return Err(DownloadError::Incomplete { expected: total, actual });
         }
-        finalize_part(part, &ctx.task.dest).await?;
+        finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await?;
         Ok(())
     }
 
@@ -359,8 +380,10 @@ impl Engine {
             if ctx.cancel.is_cancelled() {
                 return Err(DownloadError::Cancelled);
             }
+            // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）
+            let _ = tokio::fs::remove_file(part).await;
             match try_streamed_once(self.client.clone(), ctx, part, &url).await {
-                Ok(()) => return finalize_part(part, &ctx.task.dest).await,
+                Ok(()) => return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await,
                 Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
                 Err(e) => {
                     attempt += 1;
@@ -563,7 +586,8 @@ async fn try_streamed_once(
     }
     let mut file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(false) // 循环内每次尝试前删除文件，避免残留叠加
         .open(part)
         .await?;
     let mut stream = resp.bytes_stream();
@@ -582,6 +606,12 @@ async fn try_streamed_once(
                     Some(Err(e)) => return Err(DownloadError::Http(e)),
                     None => {
                         file.sync_all().await?;
+                        // 流式 EOF 校验：total 已知时必须字节数一致（chunked 截断兜底）
+                        let total = ctx.stats.total.load(Ordering::Relaxed);
+                        let downloaded = ctx.stats.downloaded.load(Ordering::Relaxed);
+                        if total > 0 && downloaded != total {
+                            return Err(DownloadError::Incomplete { expected: total, actual: downloaded });
+                        }
                         return Ok(());
                     }
                 }
@@ -719,4 +749,49 @@ async fn finalize_part(part: &Path, dest: &Path) -> Result<(), DownloadError> {
             })
         }
     }
+}
+
+/// finalize + 可选 SHA-256 校验（校验失败返回 `ChecksumMismatch`，由 run() 自动重下一次）。
+async fn finalize_verified(
+    part: &Path,
+    dest: &Path,
+    sha256: Option<[u8; 32]>,
+) -> Result<(), DownloadError> {
+    if let Some(expected) = sha256 {
+        let actual = sha256_file(part).await?;
+        if actual != expected {
+            return Err(DownloadError::ChecksumMismatch {
+                expected: hex_encode(&expected),
+                actual: hex_encode(&actual),
+            });
+        }
+    }
+    finalize_part(part, dest).await
+}
+
+/// 流式计算文件 SHA-256（分块读取，内存友好）。
+async fn sha256_file(path: &Path) -> Result<[u8; 32], DownloadError> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
