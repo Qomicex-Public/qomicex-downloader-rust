@@ -20,6 +20,17 @@ struct Entry {
     stats: Arc<DownloadStats>,
 }
 
+/// 任务进度快照（从原子统计字段读取，供轮询/桥接层使用）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DownloadProgress {
+    /// 已下载字节数。
+    pub downloaded: u64,
+    /// 总字节数（未知为 0）。
+    pub total: u64,
+    /// 当前活跃段数。
+    pub active_segments: u32,
+}
+
 /// 全局下载管理器：队列 + 两级并发控制 + 三级进度事件。
 pub struct DownloadManager {
     inner: Arc<Inner>,
@@ -209,6 +220,16 @@ impl DownloadManager {
     /// 查询任务状态。
     pub async fn state(&self, id: TaskId) -> Result<TaskState, DownloadError> {
         Ok(*self.entry(id)?.state.read().unwrap())
+    }
+
+    /// 查询任务进度快照（已下载/总量/活跃段数）。
+    pub async fn progress(&self, id: TaskId) -> Result<DownloadProgress, DownloadError> {
+        let entry = self.entry(id)?;
+        Ok(DownloadProgress {
+            downloaded: entry.stats.downloaded.load(Ordering::Relaxed),
+            total: entry.stats.total.load(Ordering::Relaxed),
+            active_segments: entry.stats.active_segments.load(Ordering::Relaxed),
+        })
     }
 
     /// 任务列表（ID + 状态）。

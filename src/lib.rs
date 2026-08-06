@@ -52,6 +52,7 @@
 //! ```
 
 pub mod error;
+pub mod jni;
 pub mod manager;
 pub mod task;
 
@@ -59,7 +60,7 @@ mod engine;
 mod segment;
 
 pub use error::DownloadError;
-pub use manager::DownloadManager;
+pub use manager::{DownloadManager, DownloadProgress};
 pub use task::{
     DownloadEvent, DownloadOptions, DownloadTask, LogLevel, TaskId, TaskState,
 };

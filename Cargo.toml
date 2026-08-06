@@ -6,7 +6,7 @@ description = "面向 Minecraft 启动器/桌面应用的高性能 Rust 下载�
 license = "MIT"
 
 [lib]
-crate-type = ["lib"]
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
@@ -16,6 +16,8 @@ thiserror = "2"
 rand = "0.9"
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = "0.10"
+jni = "0.21"
+serde_json = "1"
 
 [profile.release]
 lto = true
