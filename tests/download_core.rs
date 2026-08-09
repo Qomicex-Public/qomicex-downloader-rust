@@ -101,16 +101,37 @@ async fn small_file_single_segment() {
 
 #[tokio::test]
 async fn norange_fallback_streamed() {
-    let server = MockServer::start(1024 * 1024, Behavior { no_range: true, ..Default::default() }).await;
+    // 慢速端点保证流式路径下载中有进度事件可观测
+    // （回归防护：streamed 路径此前不上报进度，前端进度会卡 0% 直到完成）
+    let server = MockServer::start(
+        2 * 1024 * 1024,
+        Behavior {
+            no_range: true,
+            throttle: Some((300_000, 5_000_000)),
+            ..Default::default()
+        },
+    )
+    .await;
     let dir = tmp_dir("norange");
     let dest = dir.join("norange.bin");
     let m = DownloadManager::new(fast_opts(), 2);
     let mut rx = m.subscribe();
     let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
-    let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await;
-    for ev in drain_events(&mut rx) {
-        println!("EVENT: {ev:?}");
+
+    // 下载过程中应收到 downloaded > 0 且 speed_bps > 0 的进度事件
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let events = drain_events(&mut rx);
+        if events.iter().any(|e| {
+            matches!(e, DownloadEvent::Progress { downloaded, speed_bps, .. } if *downloaded > 0 && *speed_bps > 0)
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "流式路径等待非零速度进度事件超时");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await;
     assert_eq!(st, TaskState::Completed, "无 Range 回退流式未完成");
     assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "无 Range 回退流式内容不一致");
     m.shutdown().await;
@@ -493,4 +514,57 @@ async fn sha256_mismatch_fails_after_redownload() {
     );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 回归：下载源是纯重定向器（无 Range → 302，带 Range → 404）时，必须在探测解析出
+/// 的真实地址上分段下载。
+///
+/// 修复前：探测跟随重定向、看到落地主机的 `Accept-Ranges` 而判定支持分段，但传输阶段
+/// 仍拿原始 URL 发 Range 请求 → 每段 404 → 重试耗尽 → 降级整文件。表现为进度长时间
+/// 停在 0%，然后瞬间 100%（CurseForge edge.forgecdn.net 的真实症状）。
+#[tokio::test]
+async fn redirector_rejecting_range_downloads_on_resolved_url() {
+    // 限速 1MB/s：512KB 约需 0.5s，配合 20ms 的上报间隔可稳定产生中间进度采样。
+    // 不限速时 loopback 传输可能比一个上报周期还短，断言会变成时序抽奖。
+    let srv = MockServer::start(
+        512 * 1024,
+        Behavior {
+            throttle: Some((1_000_000, 1_000_000)),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("redirect-range");
+    let dest = dir.join("redirect-out.bin");
+    let _ = std::fs::remove_file(&dest);
+
+    let opts = DownloadOptions {
+        // 让 512KB 也走多段，覆盖分段路径
+        split_threshold: 64 * 1024,
+        segment_size: 64 * 1024,
+        ..fast_opts()
+    };
+    let m = DownloadManager::new(opts, 4);
+    let mut rx = m.subscribe();
+
+    let id = m.add(DownloadTask::new(srv.url("/redirect"), dest.clone()));
+    let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await;
+    assert_eq!(st, TaskState::Completed, "重定向源应能正常下载完成");
+    assert_eq!(std::fs::read(&dest).unwrap(), *srv.data, "内容应与源一致");
+
+    let evs = drain_events(&mut rx);
+    let degraded = evs.iter().any(|e| {
+        matches!(e, DownloadEvent::Log { message, .. } if message.contains("降级整文件重试"))
+    });
+    assert!(
+        !degraded,
+        "应直接在解析后的 URL 上分段下载，而不是重试耗尽后降级整文件"
+    );
+
+    // 进度必须在传输过程中真实推进，而不是从 0 直接跳到 total
+    let mid_progress = evs.iter().any(|e| {
+        matches!(e, DownloadEvent::Progress { downloaded, total, .. }
+            if *downloaded > 0 && *downloaded < *total)
+    });
+    assert!(mid_progress, "应上报中间进度，而不是 0% 之后瞬间 100%");
 }

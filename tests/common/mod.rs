@@ -135,6 +135,19 @@ async fn handle_conn(
     }
     let range = headers.get("range").cloned();
 
+    // `/redirect` 模拟纯重定向器：无 Range 时 302 到真实文件，带 Range 时直接 404。
+    // 这是 CurseForge edge.forgecdn.net 的真实行为（它 302 到 mediafilez，但对
+    // 带 Range 的请求返回 CloudFront 404）。探测走 HEAD/重定向会判定支持分段，
+    // 因此传输阶段必须使用解析后的地址，否则每一段都会失败。
+    if path == "/redirect" {
+        let resp = if range.is_some() {
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        } else {
+            "HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        };
+        return write_response(&mut stream, resp.as_bytes(), &[], None).await;
+    }
+
     if path == "/status404" || behavior.status404 {
         return write_response(
             &mut stream,

@@ -394,6 +394,7 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         events: inner.events.clone(),
         headers,
         urls: StdMutex::new(urls),
+        resolved_url: StdMutex::new(None),
         options: inner.options.clone(),
         stats: entry.stats.clone(),
         speeds: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

@@ -36,18 +36,47 @@ pub(crate) struct RunContext {
     pub headers: reqwest::header::HeaderMap,
     /// 主 URL + 镜像，按顺序轮换。
     pub urls: StdMutex<Vec<String>>,
+    /// 探测阶段跟随重定向后落地的真实 URL（本次尝试有效）。
+    ///
+    /// 某些下载源是纯重定向器：对普通 GET 返回 302，但对带 `Range` 的请求直接报错
+    /// （CurseForge 的 edge.forgecdn.net → mediafilez.forgecdn.net 就是这样，
+    /// 带 Range 会拿到 CloudFront 的 404）。探测走的是 HEAD/重定向，看到的是落地
+    /// 主机的 `Accept-Ranges`，于是判定支持分段；若随后仍拿原始 URL 发 Range 请求，
+    /// 每一段都会失败、重试耗尽、最后降级整文件——表现为进度长时间卡 0% 再瞬间 100%。
+    /// 所以这里把探测解析到的 URL 记下来，真正传输时用它。
+    pub resolved_url: StdMutex<Option<String>>,
     pub options: Arc<DownloadOptions>,
     pub stats: Arc<DownloadStats>,
     pub speeds: SpeedMap,
 }
 
 impl RunContext {
+    /// 本次尝试应当使用的 URL：优先用探测解析后的真实地址。
     pub(crate) fn current_url(&self) -> String {
+        if let Some(u) = self.resolved_url.lock().unwrap().as_ref() {
+            return u.clone();
+        }
         self.urls.lock().unwrap()[0].clone()
+    }
+
+    /// 记录探测解析出的真实 URL；与当前镜像相同则不记。
+    pub(crate) fn set_resolved_url(&self, url: &str) {
+        let mut slot = self.resolved_url.lock().unwrap();
+        if self.urls.lock().unwrap().first().map(String::as_str) == Some(url) {
+            *slot = None;
+        } else {
+            *slot = Some(url.to_string());
+        }
+    }
+
+    pub(crate) fn clear_resolved_url(&self) {
+        *self.resolved_url.lock().unwrap() = None;
     }
 
     /// 轮换到下一个镜像，返回新 URL（无镜像返回 None）。
     pub(crate) fn mirror_url(&self) -> Option<String> {
+        // 换镜像后旧的解析结果失效
+        self.clear_resolved_url();
         let mut urls = self.urls.lock().unwrap();
         if urls.len() < 2 {
             return None;
@@ -69,6 +98,8 @@ pub(crate) struct Engine {
 struct ProbeResult {
     total: Option<u64>,
     range_ok: bool,
+    /// 跟随重定向后实际应答的 URL（可能与请求的 URL 不同）。
+    effective_url: String,
 }
 
 /// 段失败类别。
@@ -113,10 +144,17 @@ impl Engine {
 
     async fn run_once(&self, ctx: &Arc<RunContext>) -> Result<(), DownloadError> {
         let part = ctx.task.part_path();
+        // 每次尝试都重新解析：上一轮的落地地址可能已失效，且换镜像后必须重新探测。
+        ctx.clear_resolved_url();
         let probe = self.probe(ctx).await?;
+        ctx.set_resolved_url(&probe.effective_url);
+        let resolved = ctx.current_url();
         ctx.log(
             LogLevel::Info,
-            format!("探测完成: total={:?}, range={}", probe.total, probe.range_ok),
+            format!(
+                "探测完成: total={:?}, range={}, url={}",
+                probe.total, probe.range_ok, resolved
+            ),
         );
         match probe.total {
             Some(t) if t > 0 => {
@@ -175,6 +213,7 @@ impl Engine {
                 return Ok(ProbeResult {
                     total: content_length(resp.headers()),
                     range_ok: accept_ranges_bytes(resp.headers()),
+                    effective_url: resp.url().to_string(),
                 });
             }
             if status.is_server_error() {
@@ -193,15 +232,18 @@ impl Engine {
             .send()
             .await?;
         let status = resp.status();
+        let effective_url = resp.url().to_string();
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
             Ok(ProbeResult {
                 total: content_range_total(resp.headers()),
                 range_ok: true,
+                effective_url,
             })
         } else if status.is_success() {
             Ok(ProbeResult {
                 total: content_length(resp.headers()),
                 range_ok: false,
+                effective_url,
             })
         } else {
             Err(DownloadError::HttpStatus {
@@ -372,41 +414,48 @@ impl Engine {
         }
         ctx.log(LogLevel::Info, format!("流式路径开始: {part:?}"));
 
-        let opts = &ctx.options;
-        let max_retries = ctx.task.max_retries.unwrap_or(opts.max_retries);
-        let mut attempt: u32 = 0;
-        let mut url = ctx.current_url();
-        loop {
-            if ctx.cancel.is_cancelled() {
-                return Err(DownloadError::Cancelled);
-            }
-            // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）
-            let _ = tokio::fs::remove_file(part).await;
-            match try_streamed_once(self.client.clone(), ctx, part, &url).await {
-                Ok(()) => return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await,
-                Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
-                Err(e) => {
-                    attempt += 1;
-                    if attempt > max_retries {
-                        match ctx.mirror_url() {
-                            Some(next) => {
-                                attempt = 0;
-                                url = next;
-                                ctx.log(LogLevel::Warn, format!("流式重试耗尽，切换镜像 {url}"));
-                                continue;
+        // 流式路径同样定期上报进度（否则下载中心进度会卡在 0% 直到完成）。
+        let reporter = spawn_progress_reporter(ctx);
+        let result = async {
+            let opts = &ctx.options;
+            let max_retries = ctx.task.max_retries.unwrap_or(opts.max_retries);
+            let mut attempt: u32 = 0;
+            let mut url = ctx.current_url();
+            loop {
+                if ctx.cancel.is_cancelled() {
+                    return Err(DownloadError::Cancelled);
+                }
+                // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）
+                let _ = tokio::fs::remove_file(part).await;
+                match try_streamed_once(self.client.clone(), ctx, part, &url).await {
+                    Ok(()) => return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await,
+                    Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt > max_retries {
+                            match ctx.mirror_url() {
+                                Some(next) => {
+                                    attempt = 0;
+                                    url = next;
+                                    ctx.log(LogLevel::Warn, format!("流式重试耗尽，切换镜像 {url}"));
+                                    continue;
+                                }
+                                None => return Err(e),
                             }
-                            None => return Err(e),
                         }
-                    }
-                    let delay = backoff(opts, attempt);
-                    ctx.log(LogLevel::Warn, format!("流式下载第 {attempt} 次重试（{e}）"));
-                    tokio::select! {
-                        _ = ctx.cancel.cancelled() => return Err(DownloadError::Cancelled),
-                        _ = sleep(delay) => {}
+                        let delay = backoff(opts, attempt);
+                        ctx.log(LogLevel::Warn, format!("流式下载第 {attempt} 次重试（{e}）"));
+                        tokio::select! {
+                            _ = ctx.cancel.cancelled() => return Err(DownloadError::Cancelled),
+                            _ = sleep(delay) => {}
+                        }
                     }
                 }
             }
         }
+        .await;
+        reporter.abort();
+        result
     }
 }
 
