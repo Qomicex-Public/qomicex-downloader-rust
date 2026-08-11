@@ -110,4 +110,4 @@ cargo doc --no-deps        # 文档
 
 ## License
 
-[MIT](LICENSE)
+[GPLv3](LICENSE)
