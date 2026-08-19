@@ -340,14 +340,12 @@ fn build_clients(
         .pool_idle_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
         .user_agent(&options.user_agent)
-        .http2_adaptive_window(true)
-        // 注意：SETTINGS_MAX_FRAME_SIZE 合法上限是 2^24-1 = 16_777_215。
-        // 直接写 16*1024*1024 (=16_777_216，超上限 1) 会是协议错误值，服务器/DPI
-        // 会按 SETTINGS 无效把 HTTP/2 连接直接断开 → “error sending request”。
-        .http2_max_frame_size((16 * 1024 * 1024) - 1)
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .build()
         .expect("构建 HTTP 客户端失败");
+    // 说明：曾加过 `http2_adaptive_window(true)` + `http2_max_frame_size(16MB-1)`，
+    // 但实测把单连接流量控制压到 ~5-7MB/s。ECL 等启动器用 httpx 默认 h2 设置即可
+    // 20MB/s+，故这里回归默认 h2 流控制（避免过度调优反而限速）。
 
     #[cfg(feature = "http3")]
     if options.enable_http3 {
