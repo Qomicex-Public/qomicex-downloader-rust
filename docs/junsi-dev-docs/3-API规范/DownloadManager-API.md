@@ -53,6 +53,7 @@ async fn main() {
 | `split_sample_interval` | 2s | 动态拆分检查周期 |
 | `progress_throttle` | 150ms | 任务级进度事件节流 |
 | `global_progress_interval` | 250ms | 全局进度聚合周期 |
+| `enable_http3` | `false` | 启用 HTTP/3 优先连接（需编译期 `--features http3` + `--cfg reqwest_unstable`；未启用该 feature 时忽略并回退 HTTP/2） |
 
 ### `DownloadTask`（builder）
 ```rust

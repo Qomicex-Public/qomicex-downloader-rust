@@ -8,6 +8,13 @@ license = "MIT"
 [lib]
 crate-type = ["lib", "cdylib"]
 
+[features]
+default = []
+# 可选：启用 HTTP/3（QUIC）。reqwest 的 http3 为 unstable 特性，需编译时
+# 额外传入 `--cfg reqwest_unstable`（见 README/项目文档）。默认关闭以保持
+# 纯净跨平台构建（Android 交叉编译不引入 quinn/QUIC 重依赖）。
+http3 = ["reqwest/http3"]
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "stream"] }

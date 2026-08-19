@@ -12,6 +12,19 @@
 //! - **断点续传**：`.part` 中间文件 + 段边界对齐，暂停后无缝续传
 //! - **原子完成**：fsync + rename，杜绝半成品文件
 //! - **三级进度**：任务级 / 全局聚合 / 日志事件，节流上报，适配 Tauri IPC
+//! - **连接层调优**：HTTP/2 adaptive window + 大帧 + TCP keepalive + 连接池上限，
+//!   HTTP/3（QUIC）可选启用
+//!
+//! ## HTTP/3（可选）
+//!
+//! HTTP/3 走 reqwest 的 **unstable** 特性，需两步启用（默认关闭）：
+//!
+//! 1. 开启 Cargo feature：`cargo build --features http3`
+//! 2. 编译期传 unstable 标志：`RUSTFLAGS="--cfg reqwest_unstable"`
+//!
+//! 运行时再通过 `DownloadOptions::enable_http3 = true` 指定本实例用 HTTP/3-only
+//! 连接（失败自动回退 HTTP/2）。因涉及 quinn/QUIC 重依赖，不建议在 Android
+//! 交叉编译等跨平台场景默认开启。
 //!
 //! ## 平台兼容
 //!

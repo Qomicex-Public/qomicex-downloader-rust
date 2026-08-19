@@ -57,13 +57,7 @@ impl DownloadManager {
     pub fn new(options: DownloadOptions, max_concurrent: usize) -> Self {
         let (events, _) = broadcast::channel(1024);
         let options = Arc::new(options);
-        let client = reqwest::Client::builder()
-            .timeout(options.timeout)
-            .connect_timeout(options.connect_timeout)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .user_agent(&options.user_agent)
-            .build()
-            .expect("构建 HTTP 客户端失败");
+        let client = build_client(&options, max_concurrent);
         let inner = Arc::new(Inner {
             options,
             events,
@@ -321,6 +315,32 @@ impl DownloadManager {
         let handle = tokio::spawn(dispatch_loop(inner));
         *self.inner.dispatcher.lock().unwrap() = Some(handle);
     }
+}
+
+/// 构建 HTTP 客户端。HTTP/2 调优默认开启；`enable_http3` 且编译期启用
+/// `http3` feature 时优先 HTTP/3-only，任一环节失败回退 HTTP/2。
+fn build_client(options: &DownloadOptions, max_concurrent: usize) -> reqwest::Client {
+    let base = || {
+        reqwest::Client::builder()
+            .timeout(options.timeout)
+            .connect_timeout(options.connect_timeout)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
+            .user_agent(&options.user_agent)
+            .http2_adaptive_window(true)
+            .http2_max_frame_size(16 * 1024 * 1024)
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+    };
+
+    #[cfg(feature = "http3")]
+    if options.enable_http3 {
+        // HTTP/3-only 客户端；构建失败（如 QUIC 初始化问题）回退 HTTP/2。
+        if let Ok(c) = base().http3_prior_knowledge().build() {
+            return c;
+        }
+    }
+
+    base().build().expect("构建 HTTP 客户端失败")
 }
 
 /// 派发循环：耗尽队列或信号量后挂起，等待 add/resume/worker 完成通知。

@@ -91,6 +91,9 @@ pub struct DownloadOptions {
     pub progress_throttle: Duration,
     /// 全局进度聚合周期。
     pub global_progress_interval: Duration,
+    /// 启用 HTTP/3（QUIC）优先连接。仅当编译期启用了 `http3` Cargo feature 时生效；
+    /// 未启用该 feature 时此开关被忽略并回退 HTTP/2。默认 false。
+    pub enable_http3: bool,
 }
 
 impl Default for DownloadOptions {
@@ -111,6 +114,7 @@ impl Default for DownloadOptions {
             split_sample_interval: Duration::from_secs(2),
             progress_throttle: Duration::from_millis(150),
             global_progress_interval: Duration::from_millis(250),
+            enable_http3: false,
         }
     }
 }
