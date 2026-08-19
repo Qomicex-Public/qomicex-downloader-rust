@@ -50,6 +50,9 @@ struct Inner {
     h3: Option<reqwest::Client>,
     /// 队列派发唤醒通知。
     dispatch: Arc<Notify>,
+    /// 按宿主的探测结果缓存（host → 支持 Range？）。同一 CDN 主机的大量小文件
+    /// 只探测一次，后续任务直接下载，避免每个文件一次 HEAD（Java 启动器同款行为）。
+    host_probe: Arc<StdRwLock<HashMap<String, bool>>>,
     /// 全局进度聚合任务。
     aggregator: StdMutex<Option<JoinHandle<()>>>,
     /// 队列派发任务。
@@ -73,6 +76,7 @@ impl DownloadManager {
             h2,
             h3,
             dispatch: Arc::new(Notify::new()),
+            host_probe: Arc::new(StdRwLock::new(HashMap::new())),
             aggregator: StdMutex::new(None),
             dispatcher: StdMutex::new(None),
         });
@@ -442,9 +446,16 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         h2: inner.h2.clone(),
         h3: inner.h3.clone(),
         use_h3: AtomicBool::new(inner.h3.is_some()),
+        host_probe: inner.host_probe.clone(),
     });
 
     let result = inner.engine.run(&ctx).await;
+    // 任务失败：清掉该主机的探测缓存，下次重试仍会重新探测（避免缓存盖住临时故障）；
+    // 成功则保留缓存，同主机的后续大量小文件直接下载、不再逐文件探测。
+    if result.is_err() {
+        let host = crate::engine::host_of(&entry.task.url);
+        inner.host_probe.write().unwrap().remove(&host);
+    }
     let (final_state, detail) = {
         let mut st = entry.state.write().unwrap();
         match result {

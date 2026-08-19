@@ -54,6 +54,9 @@ pub(crate) struct RunContext {
     pub h3: Option<reqwest::Client>,
     /// 当前是否使用 HTTP/3 优先。开启后在首个连接类失败时原子翻转为 false 回退 HTTP/2。
     pub use_h3: AtomicBool,
+    /// 按宿主的探测结果缓存（host → 支持 Range？）。跨任务共享，避免同主机大量
+    /// 小文件逐文件 HEAD 探测。
+    pub host_probe: Arc<std::sync::RwLock<HashMap<String, bool>>>,
 }
 
 impl RunContext {
@@ -196,7 +199,26 @@ impl Engine {
         let part = ctx.task.part_path();
         // 每次尝试都重新解析：上一轮的落地地址可能已失效，且换镜像后必须重新探测。
         ctx.clear_resolved_url();
+        let host = host_of(&ctx.current_url());
+
+        // 探测缓存：同一 CDN 主机第一个文件才做网络探测（HEAD），后续文件直接下载，
+        // 避免 5000 个小文件逐文件 HEAD（Java 启动器同款行为：元数据一次、并行 GET）。
+        let cached_range_ok = ctx.host_probe.read().unwrap().get(&host).copied();
+        if let Some(_range_ok) = cached_range_ok {
+            ctx.log(
+                LogLevel::Info,
+                format!("跳过探测（host {host} 已缓存），直接下载"),
+            );
+            ctx.stats.total.store(0, Ordering::Relaxed);
+            return self.run_streamed(ctx, &part).await;
+        }
+
         let probe = self.probe(ctx).await?;
+        // 探测成功后缓存该主机的 Range 支持情况
+        ctx.host_probe
+            .write()
+            .unwrap()
+            .insert(host, probe.range_ok);
         ctx.set_resolved_url(&probe.effective_url);
         let resolved = ctx.current_url();
         ctx.log(
@@ -790,6 +812,17 @@ fn spawn_progress_reporter(ctx: &Arc<RunContext>) -> JoinHandle<()> {
 }
 
 // ================= 辅助 =================
+
+/// 从 URL 提取主机名（host），用于按主机缓存探测结果。
+pub(crate) fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
 
 fn backoff(opts: &DownloadOptions, attempt: u32) -> Duration {
     let base = opts.retry_base_delay.as_millis().max(1) as u64;
