@@ -126,7 +126,11 @@ where
     let was_h3 = ctx.h3_active();
     match build(ctx.client()).await {
         Ok(resp) => Ok(resp),
-        Err(e) if was_h3 && e.is_connect() => {
+        Err(e)
+            if was_h3
+                && e.is_connect()
+                && ctx.options.http3_fallback =>
+        {
             // HTTP/3 不可达 → 持久回退 HTTP/2 并重试一次
             ctx.use_h3.store(false, Ordering::Relaxed);
             ctx.log(

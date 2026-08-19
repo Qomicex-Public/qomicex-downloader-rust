@@ -94,6 +94,11 @@ pub struct DownloadOptions {
     /// 启用 HTTP/3（QUIC）优先连接。仅当编译期启用了 `http3` Cargo feature 时生效；
     /// 未启用该 feature 时此开关被忽略并回退 HTTP/2。默认 false。
     pub enable_http3: bool,
+    /// 是否允许 HTTP/3 在连接失败时自动回退到 HTTP/2。`true` = 运行时协议回退
+    /// （服务器不支持 HTTP/3/QUIC 握手失败时切回 H2 重试）；`false` = 强制执行
+    /// HTTP/3，连接失败直接报错（不降级）。仅在 `enable_http3` 且编译期启用
+    /// `http3` feature 时生效。默认 true（保持既有回退行为）。
+    pub http3_fallback: bool,
 }
 
 impl Default for DownloadOptions {
@@ -115,6 +120,7 @@ impl Default for DownloadOptions {
             progress_throttle: Duration::from_millis(150),
             global_progress_interval: Duration::from_millis(250),
             enable_http3: false,
+            http3_fallback: true,
         }
     }
 }
