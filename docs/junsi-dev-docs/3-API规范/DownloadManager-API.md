@@ -54,6 +54,7 @@ async fn main() {
 | `progress_throttle` | 150ms | 任务级进度事件节流 |
 | `global_progress_interval` | 250ms | 全局进度聚合周期 |
 | `enable_http3` | `false` | 启用 HTTP/3 优先连接（需编译期 `--features http3` + `--cfg reqwest_unstable`）；运行时连接类失败自动回退 HTTP/2 |
+| `http3_fallback` | `true` | 是否允许 HTTP/3 连接失败时回退 HTTP/2。`false` = 强制只走 HTTP/3，连接失败直接报错（不降级）。仅在 `enable_http3` 且编译期启用 `http3` feature 时生效 |
 
 ### `DownloadTask`（builder）
 ```rust
