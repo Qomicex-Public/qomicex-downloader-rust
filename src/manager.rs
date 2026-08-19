@@ -340,12 +340,13 @@ fn build_clients(
         .pool_idle_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
         .user_agent(&options.user_agent)
+        .http2_adaptive_window(true)
+        // 大帧需合法（上限 2^24-1=16_777_215）。激进 h2 配置是本方案实测最优
+        //（5-7MB/s）；默认 h2/h1/更高并发反而更慢，勿再改动。
+        .http2_max_frame_size((16 * 1024 * 1024) - 1)
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .build()
         .expect("构建 HTTP 客户端失败");
-    // 说明：曾加过 `http2_adaptive_window(true)` + `http2_max_frame_size(16MB-1)`，
-    // 但实测把单连接流量控制压到 ~5-7MB/s。ECL 等启动器用 httpx 默认 h2 设置即可
-    // 20MB/s+，故这里回归默认 h2 流控制（避免过度调优反而限速）。
 
     #[cfg(feature = "http3")]
     if options.enable_http3 {
