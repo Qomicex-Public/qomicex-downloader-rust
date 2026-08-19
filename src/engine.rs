@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,12 @@ pub(crate) struct RunContext {
     pub options: Arc<DownloadOptions>,
     pub stats: Arc<DownloadStats>,
     pub speeds: SpeedMap,
+    /// HTTP/2 客户端（始终可用，回退目标）。
+    pub h2: reqwest::Client,
+    /// HTTP/3 客户端（仅在编译期 feature + 运行时开关同时启用时存在）。
+    pub h3: Option<reqwest::Client>,
+    /// 当前是否使用 HTTP/3 优先。开启后在首个连接类失败时原子翻转为 false 回退 HTTP/2。
+    pub use_h3: AtomicBool,
 }
 
 impl RunContext {
@@ -89,11 +95,51 @@ impl RunContext {
     pub(crate) fn log(&self, level: LogLevel, message: String) {
         let _ = self.events.send(DownloadEvent::Log { level, message });
     }
+
+    /// 当前协议选择：HTTP/3 开启且存在 h3 client 时用它，否则用 HTTP/2。
+    fn h3_active(&self) -> bool {
+        self.use_h3.load(Ordering::Relaxed) && self.h3.is_some()
+    }
+
+    /// 获取当前应使用的 client 引用（不触发回退判断）。
+    fn client(&self) -> &reqwest::Client {
+        if self.h3_active() {
+            self.h3.as_ref().unwrap()
+        } else {
+            &self.h2
+        }
+    }
 }
 
-pub(crate) struct Engine {
-    client: reqwest::Client,
+/// 一个可重试/可回退的原子请求：以 HTTP/3 优先发送，若因连接层失败（服务器
+/// 不支持 HTTP/3、QUIC 握手失败等）自动切换到 HTTP/2 重试一次，并持久翻转
+/// 本任务协议为 HTTP/2（后续请求直接走 H2）。
+/// `build` 负责基于传入的 client 构造完整的 RequestBuilder。
+async fn send_with_fallback<F, Fut>(
+    ctx: &Arc<RunContext>,
+    build: F,
+) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn(&reqwest::Client) -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    let was_h3 = ctx.h3_active();
+    match build(ctx.client()).await {
+        Ok(resp) => Ok(resp),
+        Err(e) if was_h3 && e.is_connect() => {
+            // HTTP/3 不可达 → 持久回退 HTTP/2 并重试一次
+            ctx.use_h3.store(false, Ordering::Relaxed);
+            ctx.log(
+                LogLevel::Warn,
+                format!("HTTP/3 连接失败，运行时回退 HTTP/2: {e}"),
+            );
+            build(&ctx.h2).await
+        }
+        Err(e) => Err(e),
+    }
 }
+
+pub(crate) struct Engine;
 
 struct ProbeResult {
     total: Option<u64>,
@@ -117,8 +163,8 @@ enum SegError {
 }
 
 impl Engine {
-    pub(crate) fn new(client: reqwest::Client) -> Self {
-        Self { client }
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     pub(crate) async fn run(&self, ctx: &Arc<RunContext>) -> Result<(), DownloadError> {
@@ -200,13 +246,14 @@ impl Engine {
         url: &str,
     ) -> Result<ProbeResult, DownloadError> {
         let timeout = ctx.options.timeout;
-        let head = self
-            .client
-            .head(url)
-            .headers(ctx.headers.clone())
-            .timeout(timeout)
-            .send()
-            .await;
+        let head = send_with_fallback(ctx, |client| {
+            client
+                .head(url)
+                .headers(ctx.headers.clone())
+                .timeout(timeout)
+                .send()
+        })
+        .await;
         if let Ok(resp) = head {
             let status = resp.status();
             if status.is_success() {
@@ -223,14 +270,15 @@ impl Engine {
                 });
             }
         }
-        let resp = self
-            .client
-            .get(url)
-            .headers(ctx.headers.clone())
-            .header(reqwest::header::RANGE, "bytes=0-0")
-            .timeout(timeout)
-            .send()
-            .await?;
+        let resp = send_with_fallback(ctx, |client| {
+            client
+                .get(url)
+                .headers(ctx.headers.clone())
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .timeout(timeout)
+                .send()
+        })
+        .await?;
         let status = resp.status();
         let effective_url = resp.url().to_string();
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -315,11 +363,7 @@ impl Engine {
                     }
                     let idx = seg.index;
                     ctx.stats.active_segments.fetch_add(1, Ordering::Relaxed);
-                    let ah = set.spawn(run_segment(
-                        self.client.clone(),
-                        ctx.clone(),
-                        seg,
-                    ));
+                    let ah = set.spawn(run_segment(ctx.clone(), seg));
                     seg_handles.insert(idx, ah);
                 }
             }
@@ -427,7 +471,7 @@ impl Engine {
                 }
                 // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）
                 let _ = tokio::fs::remove_file(part).await;
-                match try_streamed_once(self.client.clone(), ctx, part, &url).await {
+                match try_streamed_once(ctx, part, &url).await {
                     Ok(()) => return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await,
                     Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
                     Err(e) => {
@@ -461,11 +505,7 @@ impl Engine {
 
 // ================= 单段执行 =================
 
-async fn run_segment(
-    client: reqwest::Client,
-    ctx: Arc<RunContext>,
-    mut seg: Segment,
-) -> SegmentOutcome {
+async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
     let idx = seg.index;
     let max_retries = ctx.task.max_retries.unwrap_or(ctx.options.max_retries);
     let mut attempt: u32 = 0;
@@ -474,7 +514,7 @@ async fn run_segment(
         if ctx.cancel.is_cancelled() {
             return (idx, Err(SegFailure::Cancelled));
         }
-        match try_segment_once(&client, &ctx, &mut seg, &attempt_url).await {
+        match try_segment_once(&ctx, &mut seg, &attempt_url).await {
             Ok(()) => return (idx, Ok(())),
             Err(SegError::Cancelled) => return (idx, Err(SegFailure::Cancelled)),
             Err(SegError::Retryable(reason)) => {
@@ -503,7 +543,6 @@ async fn run_segment(
 
 /// 单段单次尝试：Range 请求 + 流式写盘 + 看门狗。
 async fn try_segment_once(
-    client: &reqwest::Client,
     ctx: &Arc<RunContext>,
     seg: &mut Segment,
     url: &str,
@@ -513,14 +552,16 @@ async fn try_segment_once(
         return Ok(());
     }
     let range = format!("bytes={from}-{}", seg.end);
-    let resp = client
-        .get(url)
-        .headers(ctx.headers.clone())
-        .header(reqwest::header::RANGE, range)
-        .timeout(ctx.options.timeout)
-        .send()
-        .await
-        .map_err(|e| SegError::Retryable(e.to_string()))?;
+    let resp = send_with_fallback(ctx, |client| {
+        client
+            .get(url)
+            .headers(ctx.headers.clone())
+            .header(reqwest::header::RANGE, range.clone())
+            .timeout(ctx.options.timeout)
+            .send()
+    })
+    .await
+    .map_err(|e| SegError::Retryable(e.to_string()))?;
     let status = resp.status();
     if status == reqwest::StatusCode::OK {
         // 200 = 全文件响应：仅当段本身覆盖整个文件且从头开始时合法（服务器对整文件 Range 返回 200）
@@ -614,17 +655,18 @@ async fn try_segment_once(
 // ================= 流式单次尝试 =================
 
 async fn try_streamed_once(
-    client: reqwest::Client,
     ctx: &Arc<RunContext>,
     part: &Path,
     url: &str,
 ) -> Result<(), DownloadError> {
-    let resp = client
-        .get(url)
-        .headers(ctx.headers.clone())
-        .timeout(ctx.options.timeout)
-        .send()
-        .await?;
+    let resp = send_with_fallback(ctx, |client| {
+        client
+            .get(url)
+            .headers(ctx.headers.clone())
+            .timeout(ctx.options.timeout)
+            .send()
+    })
+    .await?;
     let status = resp.status();
     ctx.log(LogLevel::Debug, format!("流式响应: {status}"));
     if !status.is_success() {

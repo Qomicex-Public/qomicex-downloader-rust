@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 
@@ -44,6 +44,10 @@ struct Inner {
     next_id: AtomicU64,
     semaphore: Arc<Semaphore>,
     engine: Engine,
+    /// HTTP/2 客户端（常备）。
+    h2: reqwest::Client,
+    /// HTTP/3 客户端（可选）。
+    h3: Option<reqwest::Client>,
     /// 队列派发唤醒通知。
     dispatch: Arc<Notify>,
     /// 全局进度聚合任务。
@@ -57,7 +61,7 @@ impl DownloadManager {
     pub fn new(options: DownloadOptions, max_concurrent: usize) -> Self {
         let (events, _) = broadcast::channel(1024);
         let options = Arc::new(options);
-        let client = build_client(&options, max_concurrent);
+        let (h2, h3) = build_clients(&options, max_concurrent);
         let inner = Arc::new(Inner {
             options,
             events,
@@ -65,7 +69,9 @@ impl DownloadManager {
             tasks: StdRwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
-            engine: Engine::new(client),
+            engine: Engine::new(),
+            h2,
+            h3,
             dispatch: Arc::new(Notify::new()),
             aggregator: StdMutex::new(None),
             dispatcher: StdMutex::new(None),
@@ -317,30 +323,42 @@ impl DownloadManager {
     }
 }
 
-/// 构建 HTTP 客户端。HTTP/2 调优默认开启；`enable_http3` 且编译期启用
-/// `http3` feature 时优先 HTTP/3-only，任一环节失败回退 HTTP/2。
-fn build_client(options: &DownloadOptions, max_concurrent: usize) -> reqwest::Client {
-    let base = || {
-        reqwest::Client::builder()
+/// 构建 HTTP 客户端对：(HTTP/2 常备, 可选 HTTP/3)。
+/// HTTP/2 调优默认开启；`enable_http3` 且编译期启用 `http3` feature 时额外
+/// 构建 HTTP/3-only 客户端用于运行时优先连接（失败自动回退 HTTP/2）。
+fn build_clients(
+    options: &DownloadOptions,
+    max_concurrent: usize,
+) -> (reqwest::Client, Option<reqwest::Client>) {
+    let h2 = reqwest::Client::builder()
+        .timeout(options.timeout)
+        .connect_timeout(options.connect_timeout)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
+        .user_agent(&options.user_agent)
+        .http2_adaptive_window(true)
+        .http2_max_frame_size(16 * 1024 * 1024)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .build()
+        .expect("构建 HTTP 客户端失败");
+
+    #[cfg(feature = "http3")]
+    if options.enable_http3 {
+        if let Ok(c) = reqwest::Client::builder()
             .timeout(options.timeout)
             .connect_timeout(options.connect_timeout)
             .pool_idle_timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
             .user_agent(&options.user_agent)
-            .http2_adaptive_window(true)
-            .http2_max_frame_size(16 * 1024 * 1024)
+            .http3_prior_knowledge()
             .tcp_keepalive(Some(Duration::from_secs(30)))
-    };
-
-    #[cfg(feature = "http3")]
-    if options.enable_http3 {
-        // HTTP/3-only 客户端；构建失败（如 QUIC 初始化问题）回退 HTTP/2。
-        if let Ok(c) = base().http3_prior_knowledge().build() {
-            return c;
+            .build()
+        {
+            return (h2, Some(c));
         }
     }
 
-    base().build().expect("构建 HTTP 客户端失败")
+    (h2, None)
 }
 
 /// 派发循环：耗尽队列或信号量后挂起，等待 add/resume/worker 完成通知。
@@ -418,6 +436,9 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         options: inner.options.clone(),
         stats: entry.stats.clone(),
         speeds: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        h2: inner.h2.clone(),
+        h3: inner.h3.clone(),
+        use_h3: AtomicBool::new(inner.h3.is_some()),
     });
 
     let result = inner.engine.run(&ctx).await;

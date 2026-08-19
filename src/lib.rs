@@ -22,9 +22,13 @@
 //! 1. 开启 Cargo feature：`cargo build --features http3`
 //! 2. 编译期传 unstable 标志：`RUSTFLAGS="--cfg reqwest_unstable"`
 //!
-//! 运行时再通过 `DownloadOptions::enable_http3 = true` 指定本实例用 HTTP/3-only
-//! 连接（失败自动回退 HTTP/2）。因涉及 quinn/QUIC 重依赖，不建议在 Android
-//! 交叉编译等跨平台场景默认开启。
+//! 运行时再通过 `DownloadOptions::enable_http3 = true` 指定本实例用 HTTP/3 优先
+//! 连接。**运行时协议回退**：若服务器不支持 HTTP/3（QUIC 握手/连接失败），首个
+//! 连接类错误会自动切回 HTTP/2 并持久化到当前任务，后续请求直走 H2，不影响正常
+//! 下载。因涉及 quinn/QUIC 重依赖，不建议在 Android 交叉编译等跨平台场景默认开启。
+//!
+//! 注意：HTTP/2 调优（adaptive window / 大帧 / keepalive / 连接池上限）始终生效，
+//! 无需任何 feature。
 //!
 //! ## 平台兼容
 //!
