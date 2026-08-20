@@ -100,8 +100,13 @@ pub struct DownloadOptions {
     /// `http3` feature 时生效。默认 true（保持既有回退行为）。
     pub http3_fallback: bool,
     /// 可选的完整代理 URL（如 `http://127.0.0.1:7890`、`socks5://127.0.0.1:1080`）。
-    /// `None` = 不使用代理。仅当 URL 可解析为绝对地址时才应用，否则静默忽略。
+    /// `None` = 不使用自定义代理。仅当 URL 可解析为绝对地址时才应用，否则静默忽略。
+    /// 设置了非 `None` 的代理会同时禁掉系统代理（reqwest 语义）。
     pub proxy: Option<String>,
+    /// 为 `true` 时禁用所有代理（含系统代理），等价于 reqwest `ClientBuilder::no_proxy()`。
+    /// 默认 false（保持 reqwest 默认行为 = 使用系统代理）。与 `proxy` 同时为 true 时，
+    /// `no_proxy` 先生效（结果=完全无代理）。
+    pub no_proxy: bool,
     /// 为 `true` 时禁用 TLS 证书校验（等价于 reqwest
     /// `danger_accept_invalid_certs(true)`），用于自签/不受信任证书的场景。默认 false。
     pub ignore_ssl_certs: bool,
@@ -128,6 +133,7 @@ impl Default for DownloadOptions {
             enable_http3: false,
             http3_fallback: true,
             proxy: None,
+            no_proxy: false,
             ignore_ssl_certs: false,
         }
     }

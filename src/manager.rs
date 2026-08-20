@@ -367,12 +367,15 @@ fn build_clients(
     (h2, None)
 }
 
-/// 应用全局代理与「忽略 TLS 证书校验」选项到客户端构建器。
+/// 应用代理 / 禁用代理 / 「忽略 TLS 证书校验」选项到客户端构建器。
 /// 代理 URL 无法解析为绝对地址时静默跳过（不改变行为）；其余已有设置保持不变。
 fn apply_proxy_and_tls(
     mut builder: reqwest::ClientBuilder,
     options: &DownloadOptions,
 ) -> reqwest::ClientBuilder {
+    if options.no_proxy {
+        builder = builder.no_proxy();
+    }
     if let Some(url) = &options.proxy {
         if let Ok(proxy) = reqwest::Proxy::all(url) {
             builder = builder.proxy(proxy);
