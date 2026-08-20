@@ -99,6 +99,12 @@ pub struct DownloadOptions {
     /// HTTP/3，连接失败直接报错（不降级）。仅在 `enable_http3` 且编译期启用
     /// `http3` feature 时生效。默认 true（保持既有回退行为）。
     pub http3_fallback: bool,
+    /// 可选的完整代理 URL（如 `http://127.0.0.1:7890`、`socks5://127.0.0.1:1080`）。
+    /// `None` = 不使用代理。仅当 URL 可解析为绝对地址时才应用，否则静默忽略。
+    pub proxy: Option<String>,
+    /// 为 `true` 时禁用 TLS 证书校验（等价于 reqwest
+    /// `danger_accept_invalid_certs(true)`），用于自签/不受信任证书的场景。默认 false。
+    pub ignore_ssl_certs: bool,
 }
 
 impl Default for DownloadOptions {
@@ -121,6 +127,8 @@ impl Default for DownloadOptions {
             global_progress_interval: Duration::from_millis(250),
             enable_http3: false,
             http3_fallback: true,
+            proxy: None,
+            ignore_ssl_certs: false,
         }
     }
 }

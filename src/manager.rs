@@ -334,7 +334,7 @@ fn build_clients(
     options: &DownloadOptions,
     max_concurrent: usize,
 ) -> (reqwest::Client, Option<reqwest::Client>) {
-    let h2 = reqwest::Client::builder()
+    let h2_builder = reqwest::Client::builder()
         .timeout(options.timeout)
         .connect_timeout(options.connect_timeout)
         .pool_idle_timeout(Duration::from_secs(60))
@@ -344,27 +344,44 @@ fn build_clients(
         // 大帧需合法（上限 2^24-1=16_777_215）。激进 h2 配置是本方案实测最优
         //（5-7MB/s）；默认 h2/h1/更高并发反而更慢，勿再改动。
         .http2_max_frame_size((16 * 1024 * 1024) - 1)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+    let h2 = apply_proxy_and_tls(h2_builder, options)
         .build()
         .expect("构建 HTTP 客户端失败");
 
     #[cfg(feature = "http3")]
     if options.enable_http3 {
-        if let Ok(c) = reqwest::Client::builder()
+        let h3_builder = reqwest::Client::builder()
             .timeout(options.timeout)
             .connect_timeout(options.connect_timeout)
             .pool_idle_timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
             .user_agent(&options.user_agent)
             .http3_prior_knowledge()
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .build()
-        {
+            .tcp_keepalive(Some(Duration::from_secs(30)));
+        if let Ok(c) = apply_proxy_and_tls(h3_builder, options).build() {
             return (h2, Some(c));
         }
     }
 
     (h2, None)
+}
+
+/// 应用全局代理与「忽略 TLS 证书校验」选项到客户端构建器。
+/// 代理 URL 无法解析为绝对地址时静默跳过（不改变行为）；其余已有设置保持不变。
+fn apply_proxy_and_tls(
+    mut builder: reqwest::ClientBuilder,
+    options: &DownloadOptions,
+) -> reqwest::ClientBuilder {
+    if let Some(url) = &options.proxy {
+        if let Ok(proxy) = reqwest::Proxy::all(url) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    if options.ignore_ssl_certs {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder
 }
 
 /// 派发循环：耗尽队列或信号量后挂起，等待 add/resume/worker 完成通知。
@@ -477,4 +494,40 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
     drop(permit);
     // 唤醒派发循环接手队列中的下一个任务
     inner.dispatch.notify_one();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_options_have_no_proxy_and_tls_verify() {
+        let d = DownloadOptions::default();
+        assert_eq!(d.proxy, None);
+        assert!(!d.ignore_ssl_certs);
+    }
+
+    #[test]
+    fn default_options_struct_literal_has_no_proxy_and_tls_verify() {
+        // 验证字段已加入且可赋默认值，避免遗漏导致 struct 更新编译失败。
+        let d = DownloadOptions {
+            proxy: None,
+            ignore_ssl_certs: false,
+            ..DownloadOptions::default()
+        };
+        assert_eq!(d.proxy, None);
+        assert!(!d.ignore_ssl_certs);
+    }
+
+    #[tokio::test]
+    async fn manager_constructs_with_proxy_and_ignore_ssl_certs() {
+        let opts = DownloadOptions {
+            proxy: Some("http://127.0.0.1:7890".to_string()),
+            ignore_ssl_certs: true,
+            ..DownloadOptions::default()
+        };
+        let manager = DownloadManager::new(opts, 4);
+        // 不应 panic；收尾清理后台聚合/派发任务，避免测试挂起。
+        manager.shutdown().await;
+    }
 }
