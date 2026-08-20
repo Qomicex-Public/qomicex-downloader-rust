@@ -110,6 +110,15 @@ pub struct DownloadOptions {
     /// 为 `true` 时禁用 TLS 证书校验（等价于 reqwest
     /// `danger_accept_invalid_certs(true)`），用于自签/不受信任证书的场景。默认 false。
     pub ignore_ssl_certs: bool,
+    /// 为 `true` 时强制下载一律走 HTTP/1.1 并行连接（每个文件独立 TCP 连接）。
+    /// 默认 `false` = 按来源自动路由：见 [`h1_parallel_hosts`]。
+    pub http1_parallel: bool,
+    /// 「按来源自动路由」：命中这些主机的文件强制走 HTTP/1.1 并行连接，其余主机走
+    /// HTTP/2 多路复用。用于规避「按连接限速」CDN 上 H2 多路复用把并发压到单连接的
+    /// 吞吐瓶颈（实测 Modrinth CDN 上 H1 并行快 3.7 倍），同时保留非限速源（Mojang/
+    /// BMCLAPI/CurseForge 等）在多路复用下的速度。空列表 = 全部走 HTTP/2（除非
+    /// [`http1_parallel`] 强制开启）。主机匹配：精确或子域（如 `cdn.modrinth.com`）。
+    pub h1_parallel_hosts: Vec<String>,
 }
 
 impl Default for DownloadOptions {
@@ -135,6 +144,8 @@ impl Default for DownloadOptions {
             proxy: None,
             no_proxy: false,
             ignore_ssl_certs: false,
+            http1_parallel: false,
+            h1_parallel_hosts: Vec::new(),
         }
     }
 }

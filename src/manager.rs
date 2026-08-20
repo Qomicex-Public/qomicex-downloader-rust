@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::{DownloadStats, Engine, RunContext};
 use crate::error::DownloadError;
-use crate::task::{DownloadEvent, DownloadOptions, DownloadTask, TaskId, TaskState};
+use crate::task::{DownloadEvent, DownloadOptions, DownloadTask, LogLevel, TaskId, TaskState};
 
 /// 任务条目：状态、取消令牌、worker 句柄与进度快照。
 struct Entry {
@@ -44,8 +44,10 @@ struct Inner {
     next_id: AtomicU64,
     semaphore: Arc<Semaphore>,
     engine: Engine,
-    /// HTTP/2 客户端（常备）。
+    /// HTTP/2 客户端（常备；非限速源默认走它）。
     h2: reqwest::Client,
+    /// HTTP/1.1 并行连接客户端（常备；按来源路由到限速 CDN）。
+    h1: reqwest::Client,
     /// HTTP/3 客户端（可选）。
     h3: Option<reqwest::Client>,
     /// 队列派发唤醒通知。
@@ -64,7 +66,7 @@ impl DownloadManager {
     pub fn new(options: DownloadOptions, max_concurrent: usize) -> Self {
         let (events, _) = broadcast::channel(1024);
         let options = Arc::new(options);
-        let (h2, h3) = build_clients(&options, max_concurrent);
+        let (h2, h1, h3) = build_clients(&options, max_concurrent);
         let inner = Arc::new(Inner {
             options,
             events,
@@ -74,6 +76,7 @@ impl DownloadManager {
             semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
             engine: Engine::new(),
             h2,
+            h1,
             h3,
             dispatch: Arc::new(Notify::new()),
             host_probe: Arc::new(StdRwLock::new(HashMap::new())),
@@ -327,13 +330,28 @@ impl DownloadManager {
     }
 }
 
-/// 构建 HTTP 客户端对：(HTTP/2 常备, 可选 HTTP/3)。
-/// HTTP/2 调优默认开启；`enable_http3` 且编译期启用 `http3` feature 时额外
-/// 构建 HTTP/3-only 客户端用于运行时优先连接（失败自动回退 HTTP/2）。
+/// 构建客户端三元组：(HTTP/2, HTTP/1.1 并行, 可选 HTTP/3)。
+/// - HTTP/2 常备：非限速源（Mojang/BMCLAPI/CurseForge 等）多路复用即可跑满，更快。
+/// - HTTP/1.1 并行常备：每个请求独立 TCP 连接，见 [`h1_parallel_hosts`]——对 Modrinth
+///   这类「按连接限速」的 CDN，H2 多路复用会把并发压到单连接，实测 H1 并行快 3.7 倍。
+/// - HTTP/3 可选：`enable_http3` 且编译期启用 `http3` feature 时构建，运行时优先。
 fn build_clients(
     options: &DownloadOptions,
     max_concurrent: usize,
-) -> (reqwest::Client, Option<reqwest::Client>) {
+) -> (reqwest::Client, reqwest::Client, Option<reqwest::Client>) {
+    // HTTP/1.1 并行连接客户端（每个文件独立 TCP 连接）
+    let h1_builder = reqwest::Client::builder()
+        .timeout(options.timeout)
+        .connect_timeout(options.connect_timeout)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
+        .user_agent(&options.user_agent)
+        .http1_only()
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+    let h1 = apply_proxy_and_tls(h1_builder, options)
+        .build()
+        .expect("构建 HTTP/1.1 客户端失败");
+
     let h2_builder = reqwest::Client::builder()
         .timeout(options.timeout)
         .connect_timeout(options.connect_timeout)
@@ -341,8 +359,7 @@ fn build_clients(
         .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
         .user_agent(&options.user_agent)
         .http2_adaptive_window(true)
-        // 大帧需合法（上限 2^24-1=16_777_215）。激进 h2 配置是本方案实测最优
-        //（5-7MB/s）；默认 h2/h1/更高并发反而更慢，勿再改动。
+        // 大帧需合法（上限 2^24-1=16_777_215）。激进 h2 配置是非限速源实测最优。
         .http2_max_frame_size((16 * 1024 * 1024) - 1)
         .tcp_keepalive(Some(Duration::from_secs(30)));
     let h2 = apply_proxy_and_tls(h2_builder, options)
@@ -360,11 +377,22 @@ fn build_clients(
             .http3_prior_knowledge()
             .tcp_keepalive(Some(Duration::from_secs(30)));
         if let Ok(c) = apply_proxy_and_tls(h3_builder, options).build() {
-            return (h2, Some(c));
+            return (h2, h1, Some(c));
         }
     }
 
-    (h2, None)
+    (h2, h1, None)
+}
+
+/// 判断某条 URL 是否应按来源强制走 HTTP/1.1 并行连接（限速 CDN）。
+fn host_needs_h1(host: &str, options: &DownloadOptions) -> bool {
+    if options.http1_parallel {
+        return true;
+    }
+    options
+        .h1_parallel_hosts
+        .iter()
+        .any(|e| host == e || host.ends_with(&format!(".{e}")))
 }
 
 /// 应用代理 / 禁用代理 / 「忽略 TLS 证书校验」选项到客户端构建器。
@@ -452,6 +480,16 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
     urls.push(entry.task.url.clone());
     urls.extend(entry.task.mirror_urls.clone());
 
+    // 按来源路由传输协议：限速 CDN（Modrinth 等）走 HTTP/1.1 并行，其余走 HTTP/2/3。
+    let host = crate::engine::host_of(&urls[0]);
+    let use_h1 = host_needs_h1(&host, &inner.options);
+    if use_h1 {
+        let _ = inner.events.send(DownloadEvent::Log {
+            level: LogLevel::Info,
+            message: format!("按来源使用 HTTP/1.1 并行连接: {host}"),
+        });
+    }
+
     let ctx = Arc::new(RunContext {
         task: entry.task.clone(),
         cancel: entry.cancel.lock().await.clone(),
@@ -463,8 +501,10 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         stats: entry.stats.clone(),
         speeds: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         h2: inner.h2.clone(),
+        h1: inner.h1.clone(),
         h3: inner.h3.clone(),
-        use_h3: AtomicBool::new(inner.h3.is_some()),
+        use_h1: AtomicBool::new(use_h1),
+        use_h3: AtomicBool::new(inner.h3.is_some() && !use_h1),
         host_probe: inner.host_probe.clone(),
     });
 
@@ -532,5 +572,30 @@ mod tests {
         let manager = DownloadManager::new(opts, 4);
         // 不应 panic；收尾清理后台聚合/派发任务，避免测试挂起。
         manager.shutdown().await;
+    }
+
+    #[test]
+    fn host_routing_defaults_to_h2_except_listed_cdns() {
+        // 默认：未强制 h1、未配置限速源 → 全部走 HTTP/2
+        let d = DownloadOptions::default();
+        assert!(!host_needs_h1("cdn.modrinth.com", &d));
+        assert!(!host_needs_h1("libraries.minecraft.net", &d));
+
+        // 按来源自动路由：仅命中 h1_parallel_hosts 的（含子域）走 H1，其余走 H2
+        let d = DownloadOptions {
+            h1_parallel_hosts: vec!["cdn.modrinth.com".to_string()],
+            ..Default::default()
+        };
+        assert!(host_needs_h1("cdn.modrinth.com", &d), "精确命中");
+        assert!(host_needs_h1("files.cdn.modrinth.com", &d), "子域命中");
+        assert!(!host_needs_h1("libraries.minecraft.net", &d), "非限速源保持 H2");
+        assert!(!host_needs_h1("edge.forgecdn.net", &d), "未列出主机保持 H2");
+
+        // 强制 h1：所有主机都走 H1
+        let d = DownloadOptions {
+            http1_parallel: true,
+            ..Default::default()
+        };
+        assert!(host_needs_h1("libraries.minecraft.net", &d));
     }
 }

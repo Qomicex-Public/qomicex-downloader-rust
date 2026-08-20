@@ -50,8 +50,13 @@ pub(crate) struct RunContext {
     pub speeds: SpeedMap,
     /// HTTP/2 客户端（始终可用，回退目标）。
     pub h2: reqwest::Client,
+    /// HTTP/1.1 并行连接客户端（始终可用）：每个文件独立 TCP 连接，用于「按连接限速」
+    /// 的 CDN（如 Modrinth）。由 [`use_h1`] 决定本任务是否走它。
+    pub h1: reqwest::Client,
     /// HTTP/3 客户端（仅在编译期 feature + 运行时开关同时启用时存在）。
     pub h3: Option<reqwest::Client>,
+    /// 当前是否使用 HTTP/1.1 并行（本任务已按来源路由定案，不动态翻转）。
+    pub use_h1: AtomicBool,
     /// 当前是否使用 HTTP/3 优先。开启后在首个连接类失败时原子翻转为 false 回退 HTTP/2。
     pub use_h3: AtomicBool,
     /// 按宿主的探测结果缓存（host → 支持 Range？）。跨任务共享，避免同主机大量
@@ -106,6 +111,9 @@ impl RunContext {
 
     /// 获取当前应使用的 client 引用（不触发回退判断）。
     fn client(&self) -> &reqwest::Client {
+        if self.use_h1.load(Ordering::Relaxed) {
+            return &self.h1;
+        }
         if self.h3_active() {
             self.h3.as_ref().unwrap()
         } else {
@@ -201,14 +209,33 @@ impl Engine {
         ctx.clear_resolved_url();
         let host = host_of(&ctx.current_url());
 
-        // 探测缓存：同一 CDN 主机第一个文件才做网络探测（HEAD），后续文件直接下载，
-        // 避免 5000 个小文件逐文件 HEAD（Java 启动器同款行为：元数据一次、并行 GET）。
+        // 探测缓存：同一 CDN 主机第一个文件才做网络探测（HEAD），后续文件按文件大小
+        // 决定是否跳过探测。原实现〔commit 5561263〕对所有缓存命中文件一律单连接流式
+        // （`run_streamed`），把大文件（整合包包体/大 mod）也打成单连接，吞吐仅一线，
+        // 慢 CDN 上表现为 ~100KB/s 且易触发上层下载超时；改为在主机支持 Range 时用轻量
+        // HEAD 拿文件大小，够大仍走多段并行（`run_ranged`），小文件保留单连接直传。
         let cached_range_ok = ctx.host_probe.read().unwrap().get(&host).copied();
-        if let Some(_range_ok) = cached_range_ok {
+        if let Some(range_ok) = cached_range_ok {
+            if !range_ok {
+                // 主机不支持 Range：无法分片并行，无论大小都单连接流式（保持跳过探测）
+                ctx.log(
+                    LogLevel::Info,
+                    format!("host {host} 不支持 Range，跳过探测直接下载"),
+                );
+                ctx.stats.total.store(0, Ordering::Relaxed);
+                return self.run_streamed(ctx, &part).await;
+            }
+            // Range 可用：轻量 HEAD 拿大小，够大则多段并行，小文件单连接直传。
             ctx.log(
                 LogLevel::Info,
-                format!("跳过探测（host {host} 已缓存），直接下载"),
+                format!("host {host} 已缓存，按文件大小分流"),
             );
+            if let Some(total) = self.cached_size(ctx).await {
+                if total > ctx.options.split_threshold {
+                    ctx.stats.total.store(total, Ordering::Relaxed);
+                    return self.run_ranged(ctx, &part, total).await;
+                }
+            }
             ctx.stats.total.store(0, Ordering::Relaxed);
             return self.run_streamed(ctx, &part).await;
         }
@@ -328,6 +355,27 @@ impl Engine {
     }
 
     // ---------------- Range 多段路径 ----------------
+
+    /// 缓存命中且主机支持 Range 时，用轻量 HEAD 获取文件大小，并记录跟随重定向后的
+    /// 真实地址（供 `run_ranged` 的分段 Range 请求使用，绕开纯重定向器对 Range 的 404）。
+    /// 返回文件大小；任何失败（连不上/无 Content-Length）返回 None，调用方退化为单连接流式。
+    async fn cached_size(&self, ctx: &Arc<RunContext>) -> Option<u64> {
+        let url = ctx.current_url();
+        let resp = send_with_fallback(ctx, |client| {
+            client
+                .head(url.clone())
+                .headers(ctx.headers.clone())
+                .timeout(ctx.options.timeout)
+                .send()
+        })
+        .await
+        .ok()?;
+        let resp = resp.error_for_status().ok()?;
+        let total = content_length(resp.headers())?;
+        // 记录最终落地地址，供分段请求使用
+        ctx.set_resolved_url(resp.url().as_str());
+        Some(total)
+    }
 
     async fn run_ranged(
         &self,
