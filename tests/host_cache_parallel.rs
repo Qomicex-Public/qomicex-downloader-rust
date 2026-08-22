@@ -22,11 +22,7 @@ const FILE_SIZE: usize = 12 * 1024 * 1024; // 12MB > split_threshold 10MB，需�
 const RATE: u64 = 1_048_576; // 1MB/s per connection
 
 async fn download_timed(srv: &MockServer, prime_first: bool, label: &str) -> Duration {
-    let dir = std::env::temp_dir().join(format!(
-        "qomicex-hc-{}-{}",
-        label,
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("qomicex-hc-{}-{}", label, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let m = DownloadManager::new(

@@ -9,7 +9,6 @@ use rand::Rng;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::broadcast::Sender;
-use tokio::sync::Mutex;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -24,9 +23,6 @@ pub(crate) struct DownloadStats {
     pub total: AtomicU64,
     pub active_segments: AtomicU32,
 }
-
-/// 每段速度采样（用于动态拆分选最慢段）。
-pub(crate) type SpeedMap = Arc<Mutex<HashMap<u32, (Instant, u64)>>>;
 
 /// 任务运行上下文（由 manager 构造）。
 pub(crate) struct RunContext {
@@ -47,11 +43,10 @@ pub(crate) struct RunContext {
     pub resolved_url: StdMutex<Option<String>>,
     pub options: Arc<DownloadOptions>,
     pub stats: Arc<DownloadStats>,
-    pub speeds: SpeedMap,
     /// HTTP/2 客户端（始终可用，回退目标）。
     pub h2: reqwest::Client,
     /// HTTP/1.1 并行连接客户端（始终可用）：每个文件独立 TCP 连接，用于「按连接限速」
-    /// 的 CDN（如 Modrinth）。由 [`use_h1`] 决定本任务是否走它。
+    /// 的 CDN（如 Modrinth）。分段传输（run_ranged）一律走它；流式路径按 [`use_h1`] 决定。
     pub h1: reqwest::Client,
     /// HTTP/3 客户端（仅在编译期 feature + 运行时开关同时启用时存在）。
     pub h3: Option<reqwest::Client>,
@@ -137,11 +132,7 @@ where
     let was_h3 = ctx.h3_active();
     match build(ctx.client()).await {
         Ok(resp) => Ok(resp),
-        Err(e)
-            if was_h3
-                && e.is_connect()
-                && ctx.options.http3_fallback =>
-        {
+        Err(e) if was_h3 && e.is_connect() && ctx.options.http3_fallback => {
             // HTTP/3 不可达 → 持久回退 HTTP/2 并重试一次
             ctx.use_h3.store(false, Ordering::Relaxed);
             ctx.log(
@@ -242,10 +233,7 @@ impl Engine {
 
         let probe = self.probe(ctx).await?;
         // 探测成功后缓存该主机的 Range 支持情况
-        ctx.host_probe
-            .write()
-            .unwrap()
-            .insert(host, probe.range_ok);
+        ctx.host_probe.write().unwrap().insert(host, probe.range_ok);
         ctx.set_resolved_url(&probe.effective_url);
         let resolved = ctx.current_url();
         ctx.log(
@@ -288,9 +276,7 @@ impl Engine {
                 }
             }
         }
-        Err(last_err.unwrap_or(DownloadError::Exhausted(
-            "无可用 URL".into(),
-        )))
+        Err(last_err.unwrap_or(DownloadError::Exhausted("无可用 URL".into())))
     }
 
     async fn probe_one(
@@ -500,7 +486,10 @@ impl Engine {
 
         let actual = tokio::fs::metadata(part).await?.len();
         if actual != total {
-            return Err(DownloadError::Incomplete { expected: total, actual });
+            return Err(DownloadError::Incomplete {
+                expected: total,
+                actual,
+            });
         }
         finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await?;
         Ok(())
@@ -519,11 +508,7 @@ impl Engine {
 
     // ---------------- 流式路径（服务器不支持 Range） ----------------
 
-    async fn run_streamed(
-        &self,
-        ctx: &Arc<RunContext>,
-        part: &Path,
-    ) -> Result<(), DownloadError> {
+    async fn run_streamed(&self, ctx: &Arc<RunContext>, part: &Path) -> Result<(), DownloadError> {
         if part.exists() {
             tokio::fs::remove_file(part).await?;
         }
@@ -546,7 +531,9 @@ impl Engine {
                 // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）
                 let _ = tokio::fs::remove_file(part).await;
                 match try_streamed_once(ctx, part, &url).await {
-                    Ok(()) => return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await,
+                    Ok(()) => {
+                        return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await
+                    }
                     Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
                     Err(e) => {
                         attempt += 1;
@@ -555,14 +542,20 @@ impl Engine {
                                 Some(next) => {
                                     attempt = 0;
                                     url = next;
-                                    ctx.log(LogLevel::Warn, format!("流式重试耗尽，切换镜像 {url}"));
+                                    ctx.log(
+                                        LogLevel::Warn,
+                                        format!("流式重试耗尽，切换镜像 {url}"),
+                                    );
                                     continue;
                                 }
                                 None => return Err(e),
                             }
                         }
                         let delay = backoff(opts, attempt);
-                        ctx.log(LogLevel::Warn, format!("流式下载第 {attempt} 次重试（{e}）"));
+                        ctx.log(
+                            LogLevel::Warn,
+                            format!("流式下载第 {attempt} 次重试（{e}）"),
+                        );
                         tokio::select! {
                             _ = ctx.cancel.cancelled() => return Err(DownloadError::Cancelled),
                             _ = sleep(delay) => {}
@@ -598,14 +591,20 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                         Some(next) => {
                             attempt = 0;
                             attempt_url = next;
-                            ctx.log(LogLevel::Warn, format!("段 {idx} 重试耗尽，切换镜像 {attempt_url}"));
+                            ctx.log(
+                                LogLevel::Warn,
+                                format!("段 {idx} 重试耗尽，切换镜像 {attempt_url}"),
+                            );
                             continue;
                         }
                         None => return (idx, Err(SegFailure::Exhausted(reason))),
                     }
                 }
                 let delay = backoff(&ctx.options, attempt);
-                ctx.log(LogLevel::Warn, format!("段 {idx} 第 {attempt} 次重试（{reason}）"));
+                ctx.log(
+                    LogLevel::Warn,
+                    format!("段 {idx} 第 {attempt} 次重试（{reason}）"),
+                );
                 tokio::select! {
                     _ = ctx.cancel.cancelled() => return (idx, Err(SegFailure::Cancelled)),
                     _ = sleep(delay) => {}
@@ -626,16 +625,23 @@ async fn try_segment_once(
         return Ok(());
     }
     let range = format!("bytes={from}-{}", seg.end);
-    let resp = send_with_fallback(ctx, |client| {
-        client
-            .get(url)
-            .headers(ctx.headers.clone())
-            .header(reqwest::header::RANGE, range.clone())
-            .timeout(ctx.options.timeout)
-            .send()
-    })
-    .await
-    .map_err(|e| SegError::Retryable(e.to_string()))?;
+    // aria2 式独立连接：分段请求一律走 HTTP/1.1 客户端，hyper 连接池为并发段自动
+    // 建立多条 TCP——HTTP/2 多路复用会把所有段压进同一条流，高 RTT / 按连接限速
+    // 的 CDN 上「16 段并行」实际吞吐 = 单流上限（实测镜像源单流 125KB/s vs
+    // aria2 16 连接 13MB/s）。
+    // 超时语义：仅对「等待响应头」设 options.timeout（TTFB 保护）；响应体不限时，
+    // 由看门狗负责断流/龟速检测。reqwest 的 per-request total timeout 从建连
+    // 一直计时到 body 读完，慢源上 8MB 分段 >60s 必被杀掉重试、永无完成可能。
+    let send = ctx
+        .h1
+        .get(url)
+        .headers(ctx.headers.clone())
+        .header(reqwest::header::RANGE, range.clone())
+        .send();
+    let resp = match tokio::time::timeout(ctx.options.timeout, send).await {
+        Ok(r) => r.map_err(|e| SegError::Retryable(e.to_string()))?,
+        Err(_) => return Err(SegError::Retryable("等待响应头超时".into())),
+    };
     let status = resp.status();
     if status == reqwest::StatusCode::OK {
         // 200 = 全文件响应：仅当段本身覆盖整个文件且从头开始时合法（服务器对整文件 Range 返回 200）
@@ -655,7 +661,9 @@ async fn try_segment_once(
         .truncate(false) // 断点续传：不截断已有 .part
         .open(&ctx.task.part_path())
         .await
-        .map_err(|e| SegError::Retryable(format!("打开 .part {:?} 失败: {e}", ctx.task.part_path())))?;
+        .map_err(|e| {
+            SegError::Retryable(format!("打开 .part {:?} 失败: {e}", ctx.task.part_path()))
+        })?;
     file.seek(tokio::io::SeekFrom::Start(from))
         .await
         .map_err(|e| SegError::Retryable(e.to_string()))?;
@@ -680,8 +688,6 @@ async fn try_segment_once(
                         seg.downloaded += bytes.len() as u64;
                         ctx.stats.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         last_activity = Instant::now();
-                        let mut sp = ctx.speeds.lock().await;
-                        sp.insert(seg.index, (Instant::now(), seg.downloaded));
                     }
                     Some(Err(e)) => {
                         return Err(SegError::Retryable(format!("网络中断: {e}")));
@@ -733,14 +739,22 @@ async fn try_streamed_once(
     part: &Path,
     url: &str,
 ) -> Result<(), DownloadError> {
-    let resp = send_with_fallback(ctx, |client| {
-        client
-            .get(url)
-            .headers(ctx.headers.clone())
-            .timeout(ctx.options.timeout)
-            .send()
-    })
-    .await?;
+    // 超时语义与分段路径一致：仅保护「等待响应头」（TTFB），body 不限总时长、
+    // 由看门狗 idle_timeout 检测断流——total timeout 会让慢源上的大文件永远
+    // 无法在 60s 内传完，被反复杀掉重下。
+    let resp = match tokio::time::timeout(
+        ctx.options.timeout,
+        send_with_fallback(ctx, |client| {
+            client.get(url).headers(ctx.headers.clone()).send()
+        }),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(DownloadError::Exhausted("等待响应头超时".into()));
+        }
+    };
     let status = resp.status();
     ctx.log(LogLevel::Debug, format!("流式响应: {status}"));
     if !status.is_success() {
@@ -795,14 +809,17 @@ async fn try_streamed_once(
 // ================= 动态拆分 =================
 
 /// 动态拆分：周期性检查，把剩余字节最多的活跃段一分为二（并行度提升）。
-/// 下限 64KB 避免拆分碎片；段任务被 abort 后已写字节保留，新段从拆分点继续。
+/// 段任务被 abort 后已写字节保留，新段从拆分点继续。
+/// 下限 2MB（对齐 aria2 `--min-split-size` 思路）：拆分要付出「abort 在途连接 +
+/// 新建 TCP/TLS 握手 + abort 瞬间在途数据重下」的代价，剩余不足兆级的段拆了
+/// 只会更慢——实测 64KB 下限时尾段被反复拆碎，末段吞吐从 ~10MB/s 掉到 <1MB/s。
 async fn try_split(
     ctx: &Arc<RunContext>,
     segments: &mut HashMap<u32, Segment>,
     seg_handles: &mut HashMap<u32, AbortHandle>,
     seg_counter: Arc<AtomicU32>,
 ) {
-    const MIN_SPLIT_REMAINING: u64 = 64 * 1024;
+    const MIN_SPLIT_REMAINING: u64 = 2 * 1024 * 1024;
     let target = segments
         .values()
         .filter(|s| seg_handles.contains_key(&s.index) && !s.finished())
@@ -822,10 +839,7 @@ async fn try_split(
     let (a, b) = seg.split(next);
     segments.insert(a.index, a);
     segments.insert(b.index, b);
-    ctx.log(
-        LogLevel::Info,
-        format!("动态拆分: 段 {} → 2 段", seg.index),
-    );
+    ctx.log(LogLevel::Info, format!("动态拆分: 段 {} → 2 段", seg.index));
 }
 
 // ================= 进度上报 =================
@@ -910,18 +924,16 @@ async fn finalize_part(part: &Path, dest: &Path) -> Result<(), DownloadError> {
         .open(part)
         .await
         .map_err(|e| DownloadError::Other(format!("finalize 打开 {part:?} 失败: {e}")))?;
-    f.sync_all().await.map_err(|e| {
-        DownloadError::Other(format!("finalize fsync {part:?} 失败: {e}"))
-    })?;
+    f.sync_all()
+        .await
+        .map_err(|e| DownloadError::Other(format!("finalize fsync {part:?} 失败: {e}")))?;
     drop(f);
     match tokio::fs::rename(part, dest).await {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = tokio::fs::remove_file(dest).await;
             tokio::fs::rename(part, dest).await.map_err(|e2| {
-                DownloadError::Other(format!(
-                    "rename {part:?} -> {dest:?} 失败: {e} / {e2}"
-                ))
+                DownloadError::Other(format!("rename {part:?} -> {dest:?} 失败: {e} / {e2}"))
             })
         }
     }

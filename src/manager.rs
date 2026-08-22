@@ -83,7 +83,9 @@ impl DownloadManager {
             aggregator: StdMutex::new(None),
             dispatcher: StdMutex::new(None),
         });
-        let manager = Self { inner: inner.clone() };
+        let manager = Self {
+            inner: inner.clone(),
+        };
         manager.start_aggregator();
         manager.start_dispatcher();
         manager
@@ -252,14 +254,7 @@ impl DownloadManager {
 
     /// 关闭：取消全部任务并等待 worker 退出。
     pub async fn shutdown(&self) {
-        let entries: Vec<Arc<Entry>> = self
-            .inner
-            .tasks
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
+        let entries: Vec<Arc<Entry>> = self.inner.tasks.read().unwrap().values().cloned().collect();
         for e in &entries {
             e.cancel.lock().await.cancel();
         }
@@ -499,7 +494,6 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         resolved_url: StdMutex::new(None),
         options: inner.options.clone(),
         stats: entry.stats.clone(),
-        speeds: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         h2: inner.h2.clone(),
         h1: inner.h1.clone(),
         h3: inner.h3.clone(),
@@ -588,7 +582,10 @@ mod tests {
         };
         assert!(host_needs_h1("cdn.modrinth.com", &d), "精确命中");
         assert!(host_needs_h1("files.cdn.modrinth.com", &d), "子域命中");
-        assert!(!host_needs_h1("libraries.minecraft.net", &d), "非限速源保持 H2");
+        assert!(
+            !host_needs_h1("libraries.minecraft.net", &d),
+            "非限速源保持 H2"
+        );
         assert!(!host_needs_h1("edge.forgecdn.net", &d), "未列出主机保持 H2");
 
         // 强制 h1：所有主机都走 H1

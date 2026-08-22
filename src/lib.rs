@@ -78,6 +78,4 @@ mod segment;
 
 pub use error::DownloadError;
 pub use manager::{DownloadManager, DownloadProgress};
-pub use task::{
-    DownloadEvent, DownloadOptions, DownloadTask, LogLevel, TaskId, TaskState,
-};
+pub use task::{DownloadEvent, DownloadOptions, DownloadTask, LogLevel, TaskId, TaskState};

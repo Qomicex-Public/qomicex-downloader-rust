@@ -58,7 +58,12 @@ fn parse_headers(json: &str) -> Vec<(String, String)> {
         return Vec::new();
     }
     serde_json::from_str::<Vec<[String; 2]>>(json)
-        .map(|pairs| pairs.into_iter().map(|p| (p[0].clone(), p[1].clone())).collect())
+        .map(|pairs| {
+            pairs
+                .into_iter()
+                .map(|p| (p[0].clone(), p[1].clone()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -76,8 +81,14 @@ pub extern "system" fn Java_com_qomicex_launcher_downloader_DownloaderBridge_add
     let body = panic::catch_unwind(AssertUnwindSafe(|| {
         let url: String = env.get_string(&url).map(|v| v.into()).unwrap_or_default();
         let dest: String = env.get_string(&dest).map(|v| v.into()).unwrap_or_default();
-        let sha256_hex: String = env.get_string(&sha256_hex).map(|v| v.into()).unwrap_or_default();
-        let headers_json: String = env.get_string(&headers_json).map(|v| v.into()).unwrap_or_default();
+        let sha256_hex: String = env
+            .get_string(&sha256_hex)
+            .map(|v| v.into())
+            .unwrap_or_default();
+        let headers_json: String = env
+            .get_string(&headers_json)
+            .map(|v| v.into())
+            .unwrap_or_default();
         let headers = parse_headers(&headers_json);
 
         let mut task = DownloadTask::new(url, dest);
@@ -109,7 +120,8 @@ pub extern "system" fn Java_com_qomicex_launcher_downloader_DownloaderBridge_sta
     id: jlong,
 ) -> jstring {
     let body = panic::catch_unwind(AssertUnwindSafe(|| task_json(manager(), id as u64)));
-    let body = body.unwrap_or_else(|_| r#"{"id":-1,"status":"failed","error":"state failed"}"#.to_string());
+    let body = body
+        .unwrap_or_else(|_| r#"{"id":-1,"status":"failed","error":"state failed"}"#.to_string());
     env.new_string(&body)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
@@ -124,7 +136,11 @@ pub extern "system" fn Java_com_qomicex_launcher_downloader_DownloaderBridge_lis
 ) -> jstring {
     let body = panic::catch_unwind(AssertUnwindSafe(|| {
         let rt = runtime();
-        let ids: Vec<u64> = rt.block_on(manager().list()).into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<u64> = rt
+            .block_on(manager().list())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         let arr: Vec<serde_json::Value> = ids
             .iter()
             .map(|id| {
@@ -165,8 +181,23 @@ macro_rules! define_op {
     };
 }
 
-define_op!(Java_com_qomicex_launcher_downloader_DownloaderBridge_pause, pause);
-define_op!(Java_com_qomicex_launcher_downloader_DownloaderBridge_resume, resume);
-define_op!(Java_com_qomicex_launcher_downloader_DownloaderBridge_cancel, cancel);
-define_op!(Java_com_qomicex_launcher_downloader_DownloaderBridge_retry, retry);
-define_op!(Java_com_qomicex_launcher_downloader_DownloaderBridge_remove, remove);
+define_op!(
+    Java_com_qomicex_launcher_downloader_DownloaderBridge_pause,
+    pause
+);
+define_op!(
+    Java_com_qomicex_launcher_downloader_DownloaderBridge_resume,
+    resume
+);
+define_op!(
+    Java_com_qomicex_launcher_downloader_DownloaderBridge_cancel,
+    cancel
+);
+define_op!(
+    Java_com_qomicex_launcher_downloader_DownloaderBridge_retry,
+    retry
+);
+define_op!(
+    Java_com_qomicex_launcher_downloader_DownloaderBridge_remove,
+    remove
+);

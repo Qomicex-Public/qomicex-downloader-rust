@@ -5,12 +5,12 @@
 //! 用法（在仓库根运行，须本机能访问 api.modrinth.com / cdn.modrinth.com）：
 //!
 //!   1) 从版本 id 清单拉取直链并生成 mods.txt + 直接跑测速：
-//!        cargo run --release --example modpack_ab -- --versions-file <ids.txt> \
-//!            [--concurrency 16] [--write-mods mods.txt]
+//!      cargo run --release --example modpack_ab -- --versions-file <ids.txt> \
+//!      [--concurrency 16] [--write-mods mods.txt]
 //!   2) 直接给一个 Modrinth 版本 id（拉该版本的 files[]）：
-//!        cargo run --release --example modpack_ab -- <版本id> [并发数]
+//!      cargo run --release --example modpack_ab -- <版本id> [并发数]
 //!   3) 直接用现成的直链清单（每行一个 URL）：
-//!        cargo run --release --example modpack_ab -- <urls.txt> [并发数]
+//!      cargo run --release --example modpack_ab -- <urls.txt> [并发数]
 //!
 //! 输出 H2 / H1 各自的：文件数、总字节、耗时、总吞吐(KB/s)。
 use std::collections::HashSet;
@@ -39,17 +39,24 @@ async fn main() {
         match args[i].as_str() {
             "--versions-file" => {
                 i += 1;
-                let path = args
-                    .get(i)
-                    .unwrap_or_else(|| { eprintln!("--versions-file 缺少路径"); std::process::exit(2); });
+                let path = args.get(i).unwrap_or_else(|| {
+                    eprintln!("--versions-file 缺少路径");
+                    std::process::exit(2);
+                });
                 let ids = std::fs::read_to_string(path)
-                    .unwrap_or_else(|e| { eprintln!("读取 {path} 失败: {e}"); std::process::exit(1); })
+                    .unwrap_or_else(|e| {
+                        eprintln!("读取 {path} 失败: {e}");
+                        std::process::exit(1);
+                    })
                     .lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty())
                     .map(String::from)
                     .collect::<Vec<_>>();
-                eprintln!("从 {path} 读到 {} 个版本 id，正在解析 files[].url ...", ids.len());
+                eprintln!(
+                    "从 {path} 读到 {} 个版本 id，正在解析 files[].url ...",
+                    ids.len()
+                );
                 urls = fetch_many(&ids).await;
             }
             "--concurrency" => {
@@ -63,7 +70,10 @@ async fn main() {
             other => {
                 if other.ends_with(".txt") {
                     urls = std::fs::read_to_string(other)
-                        .unwrap_or_else(|e| { eprintln!("读取 {other} 失败: {e}"); std::process::exit(1); })
+                        .unwrap_or_else(|e| {
+                            eprintln!("读取 {other} 失败: {e}");
+                            std::process::exit(1);
+                        })
                         .lines()
                         .map(str::trim)
                         .filter(|l| !l.is_empty() && l.starts_with("http"))
@@ -94,8 +104,10 @@ async fn main() {
     let mut seen = HashSet::new();
     urls.retain(|u| seen.insert(u.clone()));
     if let Some(p) = write_to {
-        std::fs::write(&p, urls.join("\n") + "\n")
-            .unwrap_or_else(|e| { eprintln!("写 {p} 失败: {e}"); std::process::exit(1); });
+        std::fs::write(&p, urls.join("\n") + "\n").unwrap_or_else(|e| {
+            eprintln!("写 {p} 失败: {e}");
+            std::process::exit(1);
+        });
         eprintln!("已写出 {} 个直链 -> {p}", urls.len());
     }
     eprintln!("文件数: {}  并发: {}\n", urls.len(), concurrency);
@@ -177,7 +189,11 @@ async fn fetch_version_url(version_id: &str) -> Option<String> {
 }
 
 fn print_row(label: &str, bytes: u64, secs: f64, n: usize) {
-    let kbs = if secs > 0.0 { bytes as f64 / secs / 1000.0 } else { 0.0 };
+    let kbs = if secs > 0.0 {
+        bytes as f64 / secs / 1000.0
+    } else {
+        0.0
+    };
     println!(
         "{:<16} {} 文件  {:>10.1} MB  耗时 {:>6.2}s  总吞吐 {:>8.1} KB/s",
         label,
@@ -199,7 +215,9 @@ async fn run_mode(client: Client, urls: &[String], concurrency: usize) -> (u64, 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             match client.get(&url).send().await {
-                Ok(r) if r.status().is_success() => r.bytes().await.map(|b| b.len() as u64).unwrap_or(0),
+                Ok(r) if r.status().is_success() => {
+                    r.bytes().await.map(|b| b.len() as u64).unwrap_or(0)
+                }
                 _ => 0,
             }
         }));

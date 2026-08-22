@@ -11,10 +11,7 @@ use qomicex_downloader::{
 use tokio::sync::broadcast::{self, Receiver};
 
 fn tmp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "qomicex-test-{tag}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("qomicex-test-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -29,12 +26,7 @@ fn fast_opts() -> DownloadOptions {
     }
 }
 
-async fn wait_state(
-    m: &DownloadManager,
-    id: u64,
-    want: TaskState,
-    timeout: Duration,
-) -> TaskState {
+async fn wait_state(m: &DownloadManager, id: u64, want: TaskState, timeout: Duration) -> TaskState {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(st) = m.state(id).await {
@@ -81,7 +73,10 @@ async fn multipart_download() {
     assert_eq!(st, TaskState::Completed, "多段下载未完成");
     let got = std::fs::read(&dest).unwrap();
     assert_eq!(got, *server.data, "多段下载内容不一致");
-    assert!(!dest.with_file_name("big.bin.part").exists(), ".part 应已被重命名");
+    assert!(
+        !dest.with_file_name("big.bin.part").exists(),
+        ".part 应已被重命名"
+    );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -93,7 +88,10 @@ async fn small_file_single_segment() {
     let dest = dir.join("small.bin");
     let m = DownloadManager::new(fast_opts(), 2);
     let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(10)).await, TaskState::Completed);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(10)).await,
+        TaskState::Completed
+    );
     assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -127,41 +125,79 @@ async fn norange_fallback_streamed() {
         }) {
             break;
         }
-        assert!(Instant::now() < deadline, "流式路径等待非零速度进度事件超时");
+        assert!(
+            Instant::now() < deadline,
+            "流式路径等待非零速度进度事件超时"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await;
     assert_eq!(st, TaskState::Completed, "无 Range 回退流式未完成");
-    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "无 Range 回退流式内容不一致");
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "无 Range 回退流式内容不一致"
+    );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn chunked_streamed() {
-    let server = MockServer::start(512 * 1024, Behavior { chunked: true, ..Default::default() }).await;
+    let server = MockServer::start(
+        512 * 1024,
+        Behavior {
+            chunked: true,
+            ..Default::default()
+        },
+    )
+    .await;
     let dir = tmp_dir("chunked");
     let dest = dir.join("chunked.bin");
     let m = DownloadManager::new(fast_opts(), 2);
     let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await, TaskState::Completed);
-    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "chunked 流式内容不一致");
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "chunked 流式内容不一致"
+    );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn flaky_segment_retry() {
-    let server = MockServer::start(1024 * 1024, Behavior { flaky: Some(3), ..Default::default() }).await;
+    let server = MockServer::start(
+        1024 * 1024,
+        Behavior {
+            flaky: Some(3),
+            ..Default::default()
+        },
+    )
+    .await;
     let dir = tmp_dir("flaky");
     let dest = dir.join("flaky.bin");
     let m = DownloadManager::new(fast_opts(), 2);
     let mut rx = m.subscribe();
     let id = m.add(DownloadTask::new(server.url("flaky"), dest.clone()));
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await, TaskState::Completed);
-    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "flaky 重试后内容不一致");
-    assert!(server.flaky_requests() >= 4, "应至少经历 3 次失败 + 1 次成功");
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "flaky 重试后内容不一致"
+    );
+    assert!(
+        server.flaky_requests() >= 4,
+        "应至少经历 3 次失败 + 1 次成功"
+    );
     let events = drain_events(&mut rx);
     assert!(
         events.iter().any(|e| matches!(e, DownloadEvent::Log { level: qomicex_downloader::LogLevel::Warn, message } if message.contains("重试"))),
@@ -178,7 +214,10 @@ async fn http_404_fails() {
     let dest = dir.join("missing.bin");
     let m = DownloadManager::new(fast_opts(), 2);
     let id = m.add(DownloadTask::new(server.url("status404"), dest.clone()));
-    assert_eq!(wait_state(&m, id, TaskState::Failed, Duration::from_secs(10)).await, TaskState::Failed);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Failed, Duration::from_secs(10)).await,
+        TaskState::Failed
+    );
     assert!(!dest.exists(), "404 不应产生目标文件");
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -189,7 +228,10 @@ async fn pause_resume_keeps_part() {
     // 慢速端点保证下载进行中有进度事件可观测
     let server = MockServer::start(
         2 * 1024 * 1024,
-        Behavior { throttle: Some((300_000, 5_000_000)), ..Default::default() },
+        Behavior {
+            throttle: Some((300_000, 5_000_000)),
+            ..Default::default()
+        },
     )
     .await;
     let dir = tmp_dir("pause");
@@ -202,9 +244,9 @@ async fn pause_resume_keeps_part() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let events = drain_events(&mut rx);
-        let some = events.iter().any(|e| {
-            matches!(e, DownloadEvent::Progress { downloaded, .. } if *downloaded > 0)
-        });
+        let some = events
+            .iter()
+            .any(|e| matches!(e, DownloadEvent::Progress { downloaded, .. } if *downloaded > 0));
         if some {
             break;
         }
@@ -216,11 +258,21 @@ async fn pause_resume_keeps_part() {
     let part = dest.with_file_name("resume.bin.part");
     assert!(part.exists(), "暂停后 .part 应保留");
     let part_size = std::fs::metadata(&part).unwrap().len();
-    assert!(part_size > 0 && part_size < 2 * 1024 * 1024, "暂停时应已下载部分数据");
+    assert!(
+        part_size > 0 && part_size < 2 * 1024 * 1024,
+        "暂停时应已下载部分数据"
+    );
 
     m.resume(id).await.unwrap();
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await, TaskState::Completed);
-    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "断点续传内容不一致");
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "断点续传内容不一致"
+    );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -230,7 +282,10 @@ async fn cancel_deletes_part() {
     // 慢速端点保证下载进行中有进度事件可观测
     let server = MockServer::start(
         2 * 1024 * 1024,
-        Behavior { throttle: Some((300_000, 5_000_000)), ..Default::default() },
+        Behavior {
+            throttle: Some((300_000, 5_000_000)),
+            ..Default::default()
+        },
     )
     .await;
     let dir = tmp_dir("cancel");
@@ -241,9 +296,9 @@ async fn cancel_deletes_part() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let events = drain_events(&mut rx);
-        let some = events.iter().any(|e| {
-            matches!(e, DownloadEvent::Progress { downloaded, .. } if *downloaded > 0)
-        });
+        let some = events
+            .iter()
+            .any(|e| matches!(e, DownloadEvent::Progress { downloaded, .. } if *downloaded > 0));
         if some {
             break;
         }
@@ -253,7 +308,10 @@ async fn cancel_deletes_part() {
     m.cancel(id).await.unwrap();
     assert_eq!(m.state(id).await.unwrap(), TaskState::Cancelled);
     assert!(!dest.exists());
-    assert!(!dest.with_file_name("cancel.bin.part").exists(), "取消后 .part 应删除");
+    assert!(
+        !dest.with_file_name("cancel.bin.part").exists(),
+        "取消后 .part 应删除"
+    );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -315,7 +373,14 @@ async fn queue_concurrency_limit() {
 
 #[tokio::test]
 async fn watchdog_rebuilds_stalled_segment() {
-    let server = MockServer::start(512 * 1024, Behavior { stall: Some(Duration::from_secs(3)), ..Default::default() }).await;
+    let server = MockServer::start(
+        512 * 1024,
+        Behavior {
+            stall: Some(Duration::from_secs(3)),
+            ..Default::default()
+        },
+    )
+    .await;
     let dir = tmp_dir("watchdog");
     let dest = dir.join("stall.bin");
     let mut opts = fast_opts();
@@ -324,11 +389,20 @@ async fn watchdog_rebuilds_stalled_segment() {
     let m = DownloadManager::new(opts, 2);
     let mut rx = m.subscribe();
     let id = m.add(DownloadTask::new(server.url("stall-once"), dest.clone()));
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await, TaskState::Completed);
-    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "看门狗重建后内容不一致");
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "看门狗重建后内容不一致"
+    );
     let events = drain_events(&mut rx);
     assert!(
-        events.iter().any(|e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("看门狗"))),
+        events
+            .iter()
+            .any(|e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("看门狗"))),
         "应产生看门狗重建日志"
     );
     m.shutdown().await;
@@ -340,7 +414,10 @@ async fn dynamic_split_on_speedup() {
     // 连接 1 慢速（500KB/s），后续连接快速（5MB/s）→ 初始单段 + 周期性拆分 → 段数逐步提升
     let server = MockServer::start(
         4 * 1024 * 1024,
-        Behavior { throttle: Some((500_000, 5_000_000)), ..Default::default() },
+        Behavior {
+            throttle: Some((500_000, 5_000_000)),
+            ..Default::default()
+        },
     )
     .await;
     let dir = tmp_dir("split");
@@ -352,13 +429,22 @@ async fn dynamic_split_on_speedup() {
     let m = DownloadManager::new(opts, 2);
     let mut rx = m.subscribe();
     let id = m.add(DownloadTask::new(server.url("throttle"), dest.clone()));
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await, TaskState::Completed);
-    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "动态拆分后内容不一致");
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "动态拆分后内容不一致"
+    );
     let events = drain_events(&mut rx);
     let max_seg = events
         .iter()
         .filter_map(|e| match e {
-            DownloadEvent::Progress { active_segments, .. } => Some(*active_segments),
+            DownloadEvent::Progress {
+                active_segments, ..
+            } => Some(*active_segments),
             _ => None,
         })
         .max()
@@ -376,14 +462,21 @@ async fn global_progress_and_log_events() {
     let m = DownloadManager::new(fast_opts(), 2);
     let mut rx = m.subscribe();
     let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await, TaskState::Completed);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await,
+        TaskState::Completed
+    );
     let events = drain_events(&mut rx);
     assert!(
-        events.iter().any(|e| matches!(e, DownloadEvent::GlobalProgress { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, DownloadEvent::GlobalProgress { .. })),
         "应收到全局聚合进度事件"
     );
     assert!(
-        events.iter().any(|e| matches!(e, DownloadEvent::Log { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, DownloadEvent::Log { .. })),
         "应收到日志事件"
     );
     m.shutdown().await;
@@ -398,11 +491,17 @@ async fn mirror_fallback_on_primary_failure() {
     let dest = dir.join("m.bin");
     let m = DownloadManager::new(fast_opts(), 2);
     let id = m.add(
-        DownloadTask::new(server.url("status404"), dest.clone())
-            .with_mirrors([server.url("file")]),
+        DownloadTask::new(server.url("status404"), dest.clone()).with_mirrors([server.url("file")]),
     );
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await, TaskState::Completed);
-    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "镜像回退后内容不一致");
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "镜像回退后内容不一致"
+    );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -415,11 +514,12 @@ async fn custom_headers_applied() {
     let mut opts = fast_opts();
     opts.headers = vec![("X-Global".into(), "1".into())];
     let m = DownloadManager::new(opts, 2);
-    let id = m.add(
-        DownloadTask::new(server.url("file"), dest.clone())
-            .with_header("X-Task", "yes"),
+    let id =
+        m.add(DownloadTask::new(server.url("file"), dest.clone()).with_header("X-Task", "yes"));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await,
+        TaskState::Completed
     );
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(15)).await, TaskState::Completed);
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -429,16 +529,27 @@ async fn streamed_retry_does_not_accumulate() {
     // 无 Range + 首次 GET 500 → 流式重试成功后文件不叠加
     let server = MockServer::start(
         512 * 1024,
-        Behavior { no_range: true, flaky: Some(1), ..Default::default() },
+        Behavior {
+            no_range: true,
+            flaky: Some(1),
+            ..Default::default()
+        },
     )
     .await;
     let dir = tmp_dir("stream-retry");
     let dest = dir.join("sr.bin");
     let m = DownloadManager::new(fast_opts(), 2);
     let id = m.add(DownloadTask::new(server.url("flaky"), dest.clone()));
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await, TaskState::Completed);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
     let got = std::fs::read(&dest).unwrap();
-    assert_eq!(got.len(), server.data.len(), "流式重试后文件不应叠加（大小必须一致）");
+    assert_eq!(
+        got.len(),
+        server.data.len(),
+        "流式重试后文件不应叠加（大小必须一致）"
+    );
     assert_eq!(got, *server.data, "流式重试后内容不一致");
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -447,15 +558,26 @@ async fn streamed_retry_does_not_accumulate() {
 #[tokio::test]
 async fn retry_after_failure_recovers() {
     // 前 5 次 GET 失败 + 禁止自动重试 → 任务 Failed → retry 直到服务器恢复 → Completed
-    let server = MockServer::start(256 * 1024, Behavior { flaky: Some(5), ..Default::default() }).await;
+    let server = MockServer::start(
+        256 * 1024,
+        Behavior {
+            flaky: Some(5),
+            ..Default::default()
+        },
+    )
+    .await;
     let dir = tmp_dir("retry");
     let dest = dir.join("r.bin");
     let m = DownloadManager::new(fast_opts(), 2);
-    let id = m.add(
-        DownloadTask::new(server.url("flaky"), dest.clone()).with_max_retries(0),
+    let id = m.add(DownloadTask::new(server.url("flaky"), dest.clone()).with_max_retries(0));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Failed, Duration::from_secs(20)).await,
+        TaskState::Failed
     );
-    assert_eq!(wait_state(&m, id, TaskState::Failed, Duration::from_secs(20)).await, TaskState::Failed);
-    assert!(server.flaky_requests() >= 2, "失败任务应至少经历 2 次 GET（段 + 降级流式）");
+    assert!(
+        server.flaky_requests() >= 2,
+        "失败任务应至少经历 2 次 GET（段 + 降级流式）"
+    );
 
     m.retry(id).await.unwrap();
     assert_eq!(m.state(id).await.unwrap(), TaskState::Queued);
@@ -475,7 +597,11 @@ async fn retry_after_failure_recovers() {
         }
     }
     assert!(recovered, "retry 后应最终恢复完成");
-    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "retry 后内容不一致");
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "retry 后内容不一致"
+    );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -489,7 +615,10 @@ async fn sha256_verifies_content() {
     let dest = dir.join("s.bin");
     let m = DownloadManager::new(fast_opts(), 2);
     let id = m.add(DownloadTask::new(server.url("file"), dest.clone()).with_sha256(digest));
-    assert_eq!(wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await, TaskState::Completed);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
     assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -504,12 +633,20 @@ async fn sha256_mismatch_fails_after_redownload() {
     let mut rx = m.subscribe();
     let wrong = [0xABu8; 32];
     let id = m.add(DownloadTask::new(server.url("file"), dest.clone()).with_sha256(wrong));
-    assert_eq!(wait_state(&m, id, TaskState::Failed, Duration::from_secs(30)).await, TaskState::Failed);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Failed, Duration::from_secs(30)).await,
+        TaskState::Failed
+    );
     assert!(!dest.exists(), "校验失败不应留下目标文件");
-    assert!(!dest.with_file_name("sbad.bin.part").exists(), "校验失败应清理 .part");
+    assert!(
+        !dest.with_file_name("sbad.bin.part").exists(),
+        "校验失败应清理 .part"
+    );
     let events = drain_events(&mut rx);
     assert!(
-        events.iter().any(|e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("SHA-256"))),
+        events.iter().any(
+            |e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("SHA-256"))
+        ),
         "应产生 SHA-256 重下日志"
     );
     m.shutdown().await;
@@ -553,9 +690,9 @@ async fn redirector_rejecting_range_downloads_on_resolved_url() {
     assert_eq!(std::fs::read(&dest).unwrap(), *srv.data, "内容应与源一致");
 
     let evs = drain_events(&mut rx);
-    let degraded = evs.iter().any(|e| {
-        matches!(e, DownloadEvent::Log { message, .. } if message.contains("降级整文件重试"))
-    });
+    let degraded = evs.iter().any(
+        |e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("降级整文件重试")),
+    );
     assert!(
         !degraded,
         "应直接在解析后的 URL 上分段下载，而不是重试耗尽后降级整文件"

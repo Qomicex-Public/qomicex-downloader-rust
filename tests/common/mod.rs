@@ -194,10 +194,7 @@ async fn handle_conn(
     if behavior.chunked {
         let header = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
         for chunk in data.chunks(16 * 1024) {
-            body_parts.push((
-                format!("{:x}\r\n", chunk.len()).into_bytes(),
-                None,
-            ));
+            body_parts.push((format!("{:x}\r\n", chunk.len()).into_bytes(), None));
             body_parts.push((chunk.to_vec(), None));
             body_parts.push((b"\r\n".to_vec(), None));
         }
@@ -242,7 +239,9 @@ async fn handle_conn(
     if path == "/stall-once" {
         if let Some(stall) = behavior.stall {
             // 首个请求：发 1KB 后停顿，后续请求正常
-            let first = conn_count.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+            let first = conn_count
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
             let total = data.len() as u64;
             let (a, b) = match parse_range(range.as_deref()) {
                 Some((a, b)) if !behavior.no_range => (a.min(total), b.min(total - 1)),
@@ -285,7 +284,8 @@ async fn handle_conn(
     let a = a.min(total);
     let b = b.min(total - 1);
     if a > b {
-        let header = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let header =
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         return write_response(&mut stream, header.as_bytes(), &[], None).await;
     }
     let header = format!(
