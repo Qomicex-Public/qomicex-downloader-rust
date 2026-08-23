@@ -705,3 +705,45 @@ async fn redirector_rejecting_range_downloads_on_resolved_url() {
     });
     assert!(mid_progress, "应上报中间进度，而不是 0% 之后瞬间 100%");
 }
+
+#[tokio::test]
+async fn dynamic_split_no_progress_overcount() {
+    // 回归防护：动态拆分 abort 在途段后，新段必须继承「真实」进度基准。
+    // 段任务持有的是 clone 副本，segments map 里的 downloaded 从不回同步；
+    // try_split 若按 map 的过期值计算继承量，被 abort 段已收的字节会被
+    // 新段重复下载并再次累进全局计数 → 进度突破 100%（直连不稳线路必现）。
+    // 场景：首连接限速制造爬行段，其余段瞬间完成；200ms 拆分tick 必然
+    // 选中爬行段（此时真实进度 >0 而 map 仍为 0）。
+    let server = MockServer::start(
+        8 * 1024 * 1024,
+        Behavior {
+            throttle: Some((500_000, 50_000_000)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("split-overcount");
+    let dest = dir.join("split-out.bin");
+    let opts = DownloadOptions {
+        split_threshold: 1024,
+        segment_size: 2 * 1024 * 1024,
+        ..fast_opts()
+    };
+    let m = DownloadManager::new(opts, 4);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await;
+    assert_eq!(st, TaskState::Completed, "应正常完成（重叠重写幂等）");
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "内容一致");
+
+    // 完成后统计不再变化：downloaded 超过 total 即证明发生过重叠二次计数。
+    let p = m.progress(id).await.unwrap();
+    assert!(
+        p.downloaded <= p.total,
+        "全局计数超过总量：downloaded={} total={}（进度会显示 {:.1}%）",
+        p.downloaded,
+        p.total,
+        p.downloaded as f64 / p.total as f64 * 100.0
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -392,7 +392,10 @@ impl Engine {
                 }
                 // 以各段对齐后的实际基准重置计数：上次尝试（暂停/中断/校验失败重下）
                 // 留下的累计值与本次 .part 不一致，会导致进度虚高或回跳。
-                let resumed: u64 = segments.values().map(|s| s.downloaded).sum();
+                let resumed: u64 = segments
+                    .values()
+                    .map(|s| s.downloaded.load(Ordering::Relaxed))
+                    .sum();
                 ctx.stats.downloaded.store(resumed, Ordering::Relaxed);
                 ctx.log(
                     LogLevel::Info,
@@ -633,7 +636,7 @@ async fn try_segment_once(
     seg: &mut Segment,
     url: &str,
 ) -> Result<(), SegError> {
-    let from = seg.start + seg.downloaded;
+    let from = seg.start + seg.downloaded.load(Ordering::Relaxed);
     if from > seg.end {
         return Ok(());
     }
@@ -659,7 +662,8 @@ async fn try_segment_once(
     if status == reqwest::StatusCode::OK {
         // 200 = 全文件响应：仅当段本身覆盖整个文件且从头开始时合法（服务器对整文件 Range 返回 200）
         let total = ctx.stats.total.load(Ordering::Relaxed);
-        let whole_file_single = seg.start == 0 && seg.end + 1 == total && seg.downloaded == 0;
+        let whole_file_single =
+            seg.start == 0 && seg.end + 1 == total && seg.downloaded.load(Ordering::Relaxed) == 0;
         if !whole_file_single {
             return Err(SegError::Retryable("服务器忽略 Range 请求".into()));
         }
@@ -688,7 +692,7 @@ async fn try_segment_once(
     let mut ema: f64 = 0.0;
     let mut slow_streak: u32 = 0;
     let mut last_activity = Instant::now();
-    let mut prev_tick_bytes = seg.downloaded;
+    let mut prev_tick_bytes = seg.downloaded.load(Ordering::Relaxed);
 
     loop {
         tokio::select! {
@@ -698,7 +702,7 @@ async fn try_segment_once(
                     Some(Ok(bytes)) => {
                         file.write_all(&bytes).await
                             .map_err(|e| SegError::Retryable(e.to_string()))?;
-                        seg.downloaded += bytes.len() as u64;
+                        seg.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         ctx.stats.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         last_activity = Instant::now();
                     }
@@ -711,9 +715,10 @@ async fn try_segment_once(
                         if seg.finished() {
                             return Ok(());
                         }
+                        let got = seg.downloaded.load(Ordering::Relaxed);
                         return Err(SegError::Retryable(format!(
                             "流提前结束: 已收 {} / 期望 {}",
-                            seg.downloaded,
+                            got,
                             seg.len()
                         )));
                     }
@@ -723,8 +728,9 @@ async fn try_segment_once(
                 if last_activity.elapsed() > idle_timeout {
                     return Err(SegError::Retryable("看门狗: 无数据超过阈值".into()));
                 }
-                let inst = (seg.downloaded.saturating_sub(prev_tick_bytes)) as f64;
-                prev_tick_bytes = seg.downloaded;
+                let inst =
+                    (seg.downloaded.load(Ordering::Relaxed).saturating_sub(prev_tick_bytes)) as f64;
+                prev_tick_bytes = seg.downloaded.load(Ordering::Relaxed);
                 if ema == 0.0 {
                     ema = inst;
                 } else {
@@ -836,12 +842,16 @@ async fn try_split(
     let target = segments
         .values()
         .filter(|s| seg_handles.contains_key(&s.index) && !s.finished())
-        .max_by_key(|s| s.len().saturating_sub(s.downloaded))
+        .max_by_key(|s| s.len().saturating_sub(s.downloaded.load(Ordering::Relaxed)))
         .cloned();
     let Some(seg) = target else {
         return;
     };
-    if seg.len().saturating_sub(seg.downloaded) < MIN_SPLIT_REMAINING {
+    if seg
+        .len()
+        .saturating_sub(seg.downloaded.load(Ordering::Relaxed))
+        < MIN_SPLIT_REMAINING
+    {
         return;
     }
     segments.remove(&seg.index);
