@@ -384,15 +384,26 @@ impl Engine {
             let part_size = meta.len();
             if part_size > total {
                 tokio::fs::remove_file(part).await?;
+                // .part 已删除、全部段从头下载：清空累计计数，否则进度会超 100%
+                ctx.stats.downloaded.store(0, Ordering::Relaxed);
             } else if part_size > 0 {
                 for s in segments.values_mut() {
                     s.align_to_part(part_size);
                 }
+                // 以各段对齐后的实际基准重置计数：上次尝试（暂停/中断/校验失败重下）
+                // 留下的累计值与本次 .part 不一致，会导致进度虚高或回跳。
+                let resumed: u64 = segments.values().map(|s| s.downloaded).sum();
+                ctx.stats.downloaded.store(resumed, Ordering::Relaxed);
                 ctx.log(
                     LogLevel::Info,
                     format!("断点续传: 已存在 .part {part_size} 字节"),
                 );
+            } else {
+                ctx.stats.downloaded.store(0, Ordering::Relaxed);
             }
+        } else {
+            // 全新下载（含 ChecksumMismatch 自动重下等 .part 已被清理的场景）
+            ctx.stats.downloaded.store(0, Ordering::Relaxed);
         }
         if let Some(parent) = part.parent() {
             tokio::fs::create_dir_all(parent)
@@ -528,8 +539,10 @@ impl Engine {
                 if ctx.cancel.is_cancelled() {
                     return Err(DownloadError::Cancelled);
                 }
-                // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）
+                // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）；
+                // 计数同步归零——.part 从头下，累计值不清会让进度超 100%
                 let _ = tokio::fs::remove_file(part).await;
+                ctx.stats.downloaded.store(0, Ordering::Relaxed);
                 match try_streamed_once(ctx, part, &url).await {
                     Ok(()) => {
                         return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await
