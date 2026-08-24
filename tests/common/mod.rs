@@ -28,6 +28,9 @@ pub fn make_data(size: usize) -> Vec<u8> {
 pub struct Behavior {
     /// 忽略 Range，总是返回 200 全文件。
     pub no_range: bool,
+    /// HEAD 谎报 `Accept-Ranges: bytes` 但 GET 照样忽略 Range（实测 dpdns.org
+    /// 镜像行为：探测判定支持分段，分片请求全部拿到全文件 200）。
+    pub lie_range: bool,
     /// Transfer-Encoding: chunked 且无 Content-Length。
     pub chunked: bool,
     /// `/flaky` 路径前 N 次 GET 返回 500。
@@ -173,7 +176,7 @@ async fn handle_conn(
 
     if method == "HEAD" {
         let total = data.len();
-        let range_hdr = if behavior.no_range {
+        let range_hdr = if behavior.no_range && !behavior.lie_range {
             ""
         } else {
             "Accept-Ranges: bytes\r\n"
@@ -209,7 +212,9 @@ async fn handle_conn(
         let delay = Duration::from_secs_f64(block as f64 / rate as f64);
         let total = data.len() as u64;
         let (a, b) = match parse_range(range.as_deref()) {
-            Some((a, b)) if !behavior.no_range => (a.min(total), b.min(total - 1)),
+            Some((a, b)) if !(behavior.no_range || behavior.lie_range) => {
+                (a.min(total), b.min(total - 1))
+            }
             _ => (0, total - 1),
         };
         if a > b {
@@ -244,7 +249,9 @@ async fn handle_conn(
                 .is_ok();
             let total = data.len() as u64;
             let (a, b) = match parse_range(range.as_deref()) {
-                Some((a, b)) if !behavior.no_range => (a.min(total), b.min(total - 1)),
+                Some((a, b)) if !(behavior.no_range || behavior.lie_range) => {
+                    (a.min(total), b.min(total - 1))
+                }
                 _ => (0, total - 1),
             };
             if a > b {
@@ -273,7 +280,7 @@ async fn handle_conn(
     // 正常路径：Range 支持
     let total = data.len() as u64;
     let parsed_range = parse_range(range.as_deref());
-    if behavior.no_range || parsed_range.is_none() {
+    if behavior.no_range || behavior.lie_range || parsed_range.is_none() {
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
         );

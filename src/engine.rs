@@ -166,6 +166,10 @@ type SegmentOutcome = (u32, Result<(), SegFailure>);
 enum SegError {
     Cancelled,
     Retryable(String),
+    /// 服务器对带 Range 的请求返回全文件 200：非瞬态故障，重试/换段均无意义，
+    /// 立即放弃分片路径转整文件流式（实测 dpdns.org 镜像：HEAD 宣称
+    /// Accept-Ranges: bytes，GET+Range 却回 200，旧逻辑每段空转 5 次重试）。
+    RangeIgnored,
 }
 
 impl Engine {
@@ -600,6 +604,17 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
         match try_segment_once(&ctx, &mut seg, &attempt_url).await {
             Ok(()) => return (idx, Ok(())),
             Err(SegError::Cancelled) => return (idx, Err(SegFailure::Cancelled)),
+            Err(SegError::RangeIgnored) => {
+                // ponytail: 不轮换镜像重试分片——镜像对 Range 的支持未知，直接整文件流式最稳
+                ctx.log(
+                    LogLevel::Warn,
+                    format!("段 {idx}: 服务器忽略 Range 请求，转整文件下载"),
+                );
+                return (
+                    idx,
+                    Err(SegFailure::Exhausted("服务器忽略 Range 请求".into())),
+                );
+            }
             Err(SegError::Retryable(reason)) => {
                 attempt += 1;
                 if attempt > max_retries {
@@ -665,7 +680,9 @@ async fn try_segment_once(
         let whole_file_single =
             seg.start == 0 && seg.end + 1 == total && seg.downloaded.load(Ordering::Relaxed) == 0;
         if !whole_file_single {
-            return Err(SegError::Retryable("服务器忽略 Range 请求".into()));
+            // 探测缓存翻转为不支持 Range：同主机后续文件直接走流式，不再撞同一堵墙
+            ctx.host_probe.write().unwrap().insert(host_of(url), false);
+            return Err(SegError::RangeIgnored);
         }
     }
     if !status.is_success() {

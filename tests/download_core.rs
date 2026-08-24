@@ -556,6 +556,66 @@ async fn streamed_retry_does_not_accumulate() {
 }
 
 #[tokio::test]
+async fn lie_range_degrades_immediately_and_flips_host_cache() {
+    // 回归防护（dpdns.org 镜像实测行为）：HEAD 宣称 Accept-Ranges: bytes，
+    // GET+Range 却返回全文件 200。修复前：每段空转 max_retries 次重试后才降级，
+    // 且同主机后续文件重复探测重复踩坑；修复后：首个 200 立即放弃分片转整文件，
+    // 并把主机探测缓存翻为 false，后续文件直接走流式。
+    let server = MockServer::start(
+        2 * 1024 * 1024,
+        Behavior {
+            lie_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("lie-range");
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let mut rx = m.subscribe();
+
+    // 文件 1：分片请求收到全文件 200 后必须立即降级，不允许出现 Range 重试
+    let dest1 = dir.join("lr1.bin");
+    let id1 = m.add(DownloadTask::new(server.url("file"), dest1.clone()));
+    assert_eq!(
+        wait_state(&m, id1, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed,
+        "lie_range 主机下载未完成"
+    );
+    assert_eq!(std::fs::read(&dest1).unwrap(), *server.data);
+    let logs1 = drain_events(&mut rx);
+    assert!(
+        !logs1
+            .iter()
+            .any(|e| matches!(e, DownloadEvent::Log { message, .. }
+            if message.contains("重试（服务器忽略 Range 请求）"))),
+        "服务器忽略 Range 时不应发生段重试: {logs1:?}"
+    );
+
+    // 文件 2：同主机必须命中翻转后的缓存，跳过探测直接流式
+    let dest2 = dir.join("lr2.bin");
+    let id2 = m.add(DownloadTask::new(server.url("file"), dest2.clone()));
+    assert_eq!(
+        wait_state(&m, id2, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&dest2).unwrap(), *server.data);
+    let logs2 = drain_events(&mut rx);
+    assert!(
+        logs2
+            .iter()
+            .any(|e| matches!(e, DownloadEvent::Log { message, .. }
+            if message.contains("不支持 Range，跳过探测直接下载"))),
+        "第二个文件应命中主机缓存直接流式: {logs2:?}"
+    );
+
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn retry_after_failure_recovers() {
     // 前 5 次 GET 失败 + 禁止自动重试 → 任务 Failed → retry 直到服务器恢复 → Completed
     let server = MockServer::start(
