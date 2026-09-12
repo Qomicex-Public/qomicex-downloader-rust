@@ -807,3 +807,46 @@ async fn dynamic_split_no_progress_overcount() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn slow_but_progressing_body_not_killed_by_timeout() {
+    // 回归防护：ClientBuilder::timeout 是「整包总超时」（reqwest TotalTimeoutBody，
+    // 从建连计时到 body 读完）。三个 client 曾设 60s 总超时，慢源上稍大的文件
+    // 永远下不完即被杀（Failed）。修复后 body 传输只受 idle watchdog 约束，
+    // 只要持续推进就应完成。
+    //
+    // 96KB @ 16KB/s = 6s 传输，故意把 timeout 压到 1s（修复前必 Failed）；
+    // idle watchdog 保持默认 30s（有数据到达就不触发）。
+    for no_range in [false, true] {
+        let server = MockServer::start(
+            96 * 1024,
+            Behavior {
+                no_range,
+                throttle: Some((16 * 1024, 16 * 1024)),
+                ..Default::default()
+            },
+        )
+        .await;
+        let dir = tmp_dir(if no_range {
+            "slow-stream"
+        } else {
+            "slow-range"
+        });
+        let dest = dir.join("slow.bin");
+        let opts = DownloadOptions {
+            timeout: Duration::from_secs(1),
+            ..fast_opts()
+        };
+        let m = DownloadManager::new(opts, 1);
+        let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+        let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await;
+        assert_eq!(
+            st,
+            TaskState::Completed,
+            "no_range={no_range}: 慢速但持续推进的下载不应被总超时杀掉"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), *server.data, "内容一致");
+        m.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -334,9 +334,11 @@ fn build_clients(
     options: &DownloadOptions,
     max_concurrent: usize,
 ) -> (reqwest::Client, reqwest::Client, Option<reqwest::Client>) {
+    // ⚠️ 不设 ClientBuilder::timeout：它是「整包总超时」（reqwest TotalTimeoutBody，
+    // 从建连计时到 body 读完），慢源上稍大的文件永远下不完即被杀。TTFB 由 engine
+    // 每请求的 tokio::time::timeout 守卫，body 传输由 idle watchdog 守卫。
     // HTTP/1.1 并行连接客户端（每个文件独立 TCP 连接）
     let h1_builder = reqwest::Client::builder()
-        .timeout(options.timeout)
         .connect_timeout(options.connect_timeout)
         .pool_idle_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
@@ -348,7 +350,6 @@ fn build_clients(
         .expect("构建 HTTP/1.1 客户端失败");
 
     let h2_builder = reqwest::Client::builder()
-        .timeout(options.timeout)
         .connect_timeout(options.connect_timeout)
         .pool_idle_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
@@ -364,7 +365,6 @@ fn build_clients(
     #[cfg(feature = "http3")]
     if options.enable_http3 {
         let h3_builder = reqwest::Client::builder()
-            .timeout(options.timeout)
             .connect_timeout(options.connect_timeout)
             .pool_idle_timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
