@@ -255,6 +255,10 @@ impl Engine {
                 }
                 self.run_streamed(ctx, &part).await
             }
+            // `Some(0)`（服务器明确声明 0 字节）与 `None`（无 Content-Length，大小未知）
+            // 都送流式路径：空体的判定统一放在 `try_streamed_once` 的 EOF 处（唯一钳位点），
+            // 这样顺带获得流式路径的重试 + 镜像轮换——主镜像回空体时会自动换下一个，
+            // 而不是在 `run_once` 里直接失败、错过可用的备选节点。
             _ => {
                 ctx.stats.total.store(0, Ordering::Relaxed);
                 self.run_streamed(ctx, &part).await
@@ -821,9 +825,19 @@ async fn try_streamed_once(
                     Some(Err(e)) => return Err(DownloadError::Http(e)),
                     None => {
                         file.sync_all().await?;
-                        // 流式 EOF 校验：total 已知时必须字节数一致（chunked 截断兜底）
                         let total = ctx.stats.total.load(Ordering::Relaxed);
                         let downloaded = ctx.stats.downloaded.load(Ordering::Relaxed);
+                        // 空响应体：服务器回 200 却一个字节都没给。镜像节点挂掉/重定向到
+                        // 坏节点时就是这样（实测 modrinth.lenmei233.dpdns.org：200 + 空 body）。
+                        // 无 Content-Length 时 `total` 为 0，下面的字节数比对覆盖不到，
+                        // 必须显式判定——否则 0 字节文件被静默 rename 成正式文件，
+                        // 直到上层解析才报错（如 zip 的 "Could not find EOCD"）。
+                        if downloaded == 0 {
+                            return Err(DownloadError::EmptyBody {
+                                url: url.to_string(),
+                            });
+                        }
+                        // 流式 EOF 校验：total 已知时必须字节数一致（chunked 截断兜底）
                         if total > 0 && downloaded != total {
                             return Err(DownloadError::Incomplete { expected: total, actual: downloaded });
                         }

@@ -29,6 +29,15 @@ pub enum DownloadError {
     #[error("下载数据不完整: 期望 {expected} 字节, 实际 {actual} 字节")]
     Incomplete { expected: u64, actual: u64 },
 
+    /// 服务器返回空响应体（0 字节）。
+    ///
+    /// 几乎总是上游异常而非合法文件：镜像节点挂掉/重定向到坏节点时会回
+    /// `200 OK` + 空 body（实测 `modrinth.lenmei233.dpdns.org` 5 次取样 4 次空体）。
+    /// 无 `Content-Length` 时无法用字节数比对发现，必须显式判定，否则 0 字节文件会被
+    /// 静默 rename 成正式文件，直到上层解析（如 zip 的 "Could not find EOCD"）才报错。
+    #[error("服务器返回空响应体（0 字节，url: {url}）")]
+    EmptyBody { url: String },
+
     /// SHA-256 校验失败（自动重下一次后仍失败）。
     #[error("SHA-256 校验失败: 期望 {expected}, 实际 {actual}")]
     ChecksumMismatch { expected: String, actual: String },

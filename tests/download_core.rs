@@ -850,3 +850,84 @@ async fn slow_but_progressing_body_not_killed_by_timeout() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// 回归（issue #118 后续）：服务器回 `200 OK` + **空响应体** 必须判失败，
+/// 不得生成 0 字节的「成功」文件。
+///
+/// 修复前：`try_streamed_once` 的 EOF 校验是 `if total > 0 && downloaded != total`。
+/// 无 `Content-Length` 时 `total == 0`，整个校验被跳过 → 空体直接 `Ok(())` →
+/// `finalize` 把 0 字节 `.part` rename 成正式文件。上层（整合包解析）到那时才发现，
+/// 报出来的却是 "invalid Zip archive: Could not find EOCD"，把上游故障伪装成文件损坏。
+///
+/// 实测触发源：镜像 `modrinth.lenmei233.dpdns.org` 挂掉时回 200 + 空 body
+/// （5 次取样 4 次空体），而官方 CDN 同时正常返回 176288 字节。
+///
+/// 两种空体形态都要覆盖：
+/// - `chunked`（无 Content-Length，`total` 保持 0）→ 命中被跳过的那条分支
+/// - 默认（`Content-Length: 0`）→ 明确声明 0 字节
+#[tokio::test]
+async fn empty_body_response_is_failure_not_zero_byte_success() {
+    for (tag, behavior) in [
+        (
+            "empty-chunked",
+            Behavior {
+                chunked: true,
+                ..Default::default()
+            },
+        ),
+        ("empty-length0", Behavior::default()),
+    ] {
+        // data_size = 0 → mock 回合法但空的 body（chunked 模式发 `0\r\n\r\n`）
+        let server = MockServer::start(0, behavior).await;
+        let dir = tmp_dir(tag);
+        let dest = dir.join("empty.mrpack");
+        // 重试/镜像都快速耗尽，避免用例拖长；默认 max_retries=5 + 10ms 退避
+        let m = DownloadManager::new(fast_opts(), 1);
+        let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+        let st = wait_state(&m, id, TaskState::Failed, Duration::from_secs(20)).await;
+
+        assert_eq!(
+            st,
+            TaskState::Failed,
+            "{tag}: 空响应体必须判 Failed，而不是 Completed"
+        );
+        assert!(
+            !dest.exists(),
+            "{tag}: 不得把 0 字节文件 rename 成正式文件（{dest:?}）"
+        );
+        m.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 回归对照：非空但**大小未知**（chunked，无 Content-Length）的文件仍须成功。
+///
+/// 防止上面的空体修复矫枉过正——把 `total == 0` 一律当失败会误杀
+/// 所有 chunked 响应（CDN 常见的传输编码）。
+#[tokio::test]
+async fn chunked_non_empty_still_succeeds() {
+    let server = MockServer::start(
+        64 * 1024,
+        Behavior {
+            chunked: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("chunked-ok");
+    let dest = dir.join("ok.bin");
+    let m = DownloadManager::new(fast_opts(), 1);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed,
+        "chunked 非空响应不应被空体判定误杀"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "chunked 内容应完整"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
