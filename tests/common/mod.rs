@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 测试用 mock HTTP 服务器：支持 Range、HEAD、异常注入（flaky/stall/throttle/rampup）。
 #![allow(dead_code)]
 

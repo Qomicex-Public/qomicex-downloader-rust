@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # qomicex-downloader
 //!
 //! 面向 Minecraft 启动器/桌面应用的高性能下载核心库。

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 回归测试：同 host 缓存命中时，大文件必须恢复多段并行，不能退化成单连接流式。
 //!
 //! 背景：`run_once` 的 host_probe 缓存短路曾把所有缓存命中文件一律打成单连接

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /// 一个下载段：`[start, end]` 闭区间，`downloaded` 为相对 `start` 已写入字节数。
 ///
 /// `downloaded` 是共享原子计数：段任务与 `run_ranged` 的 segments 表持有同一份

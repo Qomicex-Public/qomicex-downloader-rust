@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! 真机 A/B 测速：同一批 Modrinth 整合包 mod 文件，分别用「HTTP/2 激进配置」与
 //! 「HTTP/1.1 并行连接」并发下载，对比总吞吐，用于判定 Modrinth CDN 的限速是
 //! 「按连接」(→ h1 并行更好) 还是「按 IP/总带宽」(→ 两者差不多)。

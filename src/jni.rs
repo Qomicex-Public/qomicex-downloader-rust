@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! JNI 桥接层：供 Android (Kotlin) 调用下载核心库。
 //!
 //! 导出约定：`Java_<包名以_分隔>_<类名>_<方法名>`，

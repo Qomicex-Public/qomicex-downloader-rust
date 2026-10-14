@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Qomicex Launcher Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use qomicex_downloader::{DownloadManager, DownloadOptions, DownloadTask, TaskState};
 use std::time::{Duration, Instant};
 
