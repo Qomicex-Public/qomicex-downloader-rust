@@ -76,6 +76,7 @@ pub mod jni;
 pub mod manager;
 pub mod task;
 
+pub mod dns;
 mod engine;
 mod segment;
 

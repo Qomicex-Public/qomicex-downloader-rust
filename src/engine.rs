@@ -64,6 +64,9 @@ pub(crate) struct RunContext {
     /// 一个字节都没给出来，后续文件直接把它排到最后，不必每个文件都再等一轮
     /// 看门狗。TTL 到期自动恢复尝试，避免源只是短暂抖动就被永久拉黑。
     pub dead_hosts: Arc<StdMutex<HashMap<String, Instant>>>,
+    /// IP 级健康表（下载器内部实现，启动器不感知）。代理生效时为 None，
+    /// 此时只保留域名级拉黑。
+    pub ip_health: Option<Arc<crate::dns::IpHealth>>,
     /// 本次尝试是否已经因「文件够大且支持 Range」切过分片。
     ///
     /// 防止 `run_ranged` 降级整文件 → `run_streamed` 再嗅探 → 又切回分片
@@ -86,6 +89,28 @@ impl RunContext {
     /// 宿主成功交付过数据 → 解除拉黑。
     pub(crate) fn mark_host_alive(&self, host: &str) {
         self.dead_hosts.lock().unwrap().remove(host);
+    }
+
+    /// 本次尝试零字节 → 判定该源不可用。
+    ///
+    /// **优先只拉黑这个 IP**：同一域名（BMCLAPI、ForgeCDN）背后是多 CDN，
+    /// 屏蔽域名会连带废掉可用节点。只有拿不到对端 IP（连接未建立 / 未启用
+    /// IP 级）时才退回域名级拉黑。
+    pub(crate) fn mark_source_dead(&self, url: &str) {
+        let host = host_of(url);
+        if let Some(h) = &self.ip_health {
+            if h.mark_failure(&host) {
+                return;
+            }
+        }
+        self.mark_host_dead(&host);
+    }
+
+    /// 记录本次连接的对端地址：确认该 IP 可用，解除其拉黑。
+    pub(crate) fn note_remote(&self, url: &str, addr: Option<std::net::SocketAddr>) {
+        if let (Some(h), Some(a)) = (&self.ip_health, addr) {
+            h.mark_ok(&host_of(url), a.ip());
+        }
     }
 
     /// 本次尝试应当使用的 URL：优先用探测解析后的真实地址。
@@ -443,7 +468,7 @@ impl Engine {
                         // 约 5 分钟才用上可用镜像。
                         let got_bytes = ctx.stats.downloaded.load(Ordering::Relaxed) > 0;
                         if !got_bytes {
-                            ctx.mark_host_dead(&host_of(&url));
+                            ctx.mark_source_dead(&url);
                         }
                         if !got_bytes && ctx.has_other_url() {
                             if let Some(next) = ctx.mirror_url() {
@@ -520,7 +545,7 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                 // 不在同一源上耗尽重试预算（默认 5 次 × 看门狗 30s）。
                 let progressed = seg.downloaded.load(Ordering::Relaxed) > 0;
                 if !progressed {
-                    ctx.mark_host_dead(&host_of(&attempt_url));
+                    ctx.mark_source_dead(&attempt_url);
                     if ctx.has_other_url() {
                         if let Some(next) = ctx.mirror_url() {
                             attempt = 0;
@@ -605,6 +630,8 @@ async fn try_segment_once(
     if !status.is_success() {
         return Err(SegError::Retryable(format!("HTTP {status} ({url})")));
     }
+    // 连接已建立：记录对端 IP，确认该节点可用（IP 级黑名单据此解除）。
+    ctx.note_remote(url, resp.remote_addr());
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -717,6 +744,7 @@ async fn try_streamed_once(
             url: url.to_string(),
         });
     }
+    ctx.note_remote(url, resp.remote_addr());
 
     // 用响应头完成原来 HEAD 探测承担的两件事：
     //   1. 记录跟随重定向后的真实地址（纯重定向器对带 Range 的请求会报错，

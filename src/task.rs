@@ -116,6 +116,13 @@ pub struct DownloadOptions {
     /// 为 `true` 时强制下载一律走 HTTP/1.1 并行连接（每个文件独立 TCP 连接）。
     /// 默认 `false` = 按来源自动路由：见 [`h1_parallel_hosts`]。
     pub http1_parallel: bool,
+    /// 是否按 **IP** 而不是域名记录下载源健康状态。
+    ///
+    /// 同一域名背后常是多家 CDN（如 BMCLAPI、ForgeCDN），部分节点几乎不可用；
+    /// 按域名拉黑会连带废弃好节点。开启后失败只拉黑该次连接的 IP，并让解析器
+    /// 优先返回未拉黑的地址。走 HTTP 代理时连接对端是代理，归因会失真，
+    /// 因此 proxy / 系统代理生效时自动关闭（见 manager）。
+    pub ip_level_blocking: bool,
     /// 「按来源自动路由」：命中这些主机的文件强制走 HTTP/1.1 并行连接，其余主机走
     /// HTTP/2 多路复用。用于规避「按连接限速」CDN 上 H2 多路复用把并发压到单连接的
     /// 吞吐瓶颈（实测 Modrinth CDN 上 H1 并行快 3.7 倍），同时保留非限速源（Mojang/
@@ -149,6 +156,7 @@ impl Default for DownloadOptions {
             ignore_ssl_certs: false,
             http1_parallel: false,
             h1_parallel_hosts: Vec::new(),
+            ip_level_blocking: true,
         }
     }
 }

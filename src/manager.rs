@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::dns::{IpHealth, TrackingResolver};
 use crate::engine::{DownloadStats, Engine, RunContext};
 use crate::error::DownloadError;
 use crate::task::{DownloadEvent, DownloadOptions, DownloadTask, LogLevel, TaskId, TaskState};
@@ -61,6 +62,8 @@ struct Inner {
     /// 已知在拉黑期内的宿主（host → 发现时刻）。任务启动时把它们的镜像排到最后，
     /// 避免同一批文件里每个都去撞同一个挂掉的源。
     host_dead: Arc<StdMutex<HashMap<String, Instant>>>,
+    /// IP 级健康表 + 自定义解析器；代理生效时为 None（对端是代理，归因失真）。
+    ip_health: Option<Arc<IpHealth>>,
     /// 全局进度聚合任务。
     aggregator: StdMutex<Option<JoinHandle<()>>>,
     /// 队列派发任务。
@@ -72,7 +75,14 @@ impl DownloadManager {
     pub fn new(options: DownloadOptions, max_concurrent: usize) -> Self {
         let (events, _) = broadcast::channel(1024);
         let options = Arc::new(options);
-        let (h2, h1, h3) = build_clients(&options, max_concurrent);
+        // 走代理时连接对端是代理而非源站，IP 归因会失真 → 只保留域名级拉黑。
+        let ip_health =
+            if options.ip_level_blocking && options.proxy.is_none() && !env_proxy_configured() {
+                Some(IpHealth::new())
+            } else {
+                None
+            };
+        let (h2, h1, h3) = build_clients(&options, max_concurrent, ip_health.clone());
         let inner = Arc::new(Inner {
             options,
             events,
@@ -87,6 +97,7 @@ impl DownloadManager {
             dispatch: Arc::new(Notify::new()),
             host_probe: Arc::new(StdRwLock::new(HashMap::new())),
             host_dead: Arc::new(StdMutex::new(HashMap::new())),
+            ip_health,
             aggregator: StdMutex::new(None),
             dispatcher: StdMutex::new(None),
         });
@@ -340,7 +351,14 @@ impl DownloadManager {
 fn build_clients(
     options: &DownloadOptions,
     max_concurrent: usize,
+    ip_health: Option<Arc<IpHealth>>,
 ) -> (reqwest::Client, reqwest::Client, Option<reqwest::Client>) {
+    // 自定义解析器：按 IP 健康表过滤地址，并让「返回的地址」与「实际连接的地址」
+    // 一一对应（失败归因的前提）。
+    let with_resolver = |b: reqwest::ClientBuilder| match &ip_health {
+        Some(h) => b.dns_resolver(Arc::new(TrackingResolver::new(h.clone()))),
+        None => b,
+    };
     // ⚠️ 不设 ClientBuilder::timeout：它是「整包总超时」（reqwest TotalTimeoutBody，
     // 从建连计时到 body 读完），慢源上稍大的文件永远下不完即被杀。TTFB 由 engine
     // 每请求的 tokio::time::timeout 守卫，body 传输由 idle watchdog 守卫。
@@ -352,7 +370,7 @@ fn build_clients(
         .user_agent(&options.user_agent)
         .http1_only()
         .tcp_keepalive(Some(Duration::from_secs(30)));
-    let h1 = apply_proxy_and_tls(h1_builder, options)
+    let h1 = apply_proxy_and_tls(with_resolver(h1_builder), options)
         .build()
         .expect("构建 HTTP/1.1 客户端失败");
 
@@ -365,7 +383,7 @@ fn build_clients(
         // 大帧需合法（上限 2^24-1=16_777_215）。激进 h2 配置是非限速源实测最优。
         .http2_max_frame_size((16 * 1024 * 1024) - 1)
         .tcp_keepalive(Some(Duration::from_secs(30)));
-    let h2 = apply_proxy_and_tls(h2_builder, options)
+    let h2 = apply_proxy_and_tls(with_resolver(h2_builder), options)
         .build()
         .expect("构建 HTTP 客户端失败");
 
@@ -397,6 +415,24 @@ fn host_needs_h1(host: &str, options: &DownloadOptions) -> bool {
         .any(|e| host == e || host.ends_with(&format!(".{e}")))
 }
 
+/// 环境变量里是否配置了代理。reqwest 默认会读取这些变量且系统代理同样生效，
+/// 此时连接对端是代理，IP 级归因无意义。
+fn env_proxy_configured() -> bool {
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|k| {
+        std::env::var(k)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
 /// 应用代理 / 禁用代理 / 「忽略 TLS 证书校验」选项到客户端构建器。
 /// 代理 URL 无法解析为绝对地址时静默跳过（不改变行为）；其余已有设置保持不变。
 fn apply_proxy_and_tls(
@@ -517,6 +553,7 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         use_h3: AtomicBool::new(inner.h3.is_some() && !use_h1),
         host_probe: inner.host_probe.clone(),
         dead_hosts: inner.host_dead.clone(),
+        ip_health: inner.ip_health.clone(),
         ranged_attempted: AtomicBool::new(false),
     });
 
