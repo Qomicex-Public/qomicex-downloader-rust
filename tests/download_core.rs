@@ -44,6 +44,27 @@ async fn wait_state(m: &DownloadManager, id: u64, want: TaskState, timeout: Dura
     }
 }
 
+/// 轮询到任意终态（Completed/Failed/Cancelled）即返回，未到则返回当前状态。
+/// 用于「失败→retry→再失败」的循环：不能用 `wait_state(..., Completed)`，否则
+/// 每轮都会空等满超时窗口。
+async fn wait_terminal(m: &DownloadManager, id: u64, timeout: Duration) -> TaskState {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(st) = m.state(id).await {
+            if matches!(
+                st,
+                TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+            ) {
+                return st;
+            }
+        }
+        if Instant::now() > deadline {
+            return m.state(id).await.unwrap_or(TaskState::Failed);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn drain_events(rx: &mut Receiver<DownloadEvent>) -> Vec<DownloadEvent> {
     let mut out = Vec::new();
     loop {
@@ -597,7 +618,9 @@ async fn lie_range_degrades_immediately_and_flips_host_cache() {
         "服务器忽略 Range 时不应发生段重试: {logs1:?}"
     );
 
-    // 文件 2：同主机必须命中翻转后的缓存，跳过探测直接流式
+    // 文件 2：同主机的「谎报 Range」结论必须复用——不再切分片，直接流式落盘。
+    // 断言落在请求形态上（而不是日志文案）：文件 2 不应再产生任何 Range 请求。
+    let ranges_before = server.range_requests();
     let dest2 = dir.join("lr2.bin");
     let id2 = m.add(DownloadTask::new(server.url("file"), dest2.clone()));
     assert_eq!(
@@ -605,13 +628,15 @@ async fn lie_range_degrades_immediately_and_flips_host_cache() {
         TaskState::Completed
     );
     assert_eq!(std::fs::read(&dest2).unwrap(), *server.data);
-    let logs2 = drain_events(&mut rx);
-    assert!(
-        logs2
-            .iter()
-            .any(|e| matches!(e, DownloadEvent::Log { message, .. }
-            if message.contains("不支持 Range，跳过探测直接下载"))),
-        "第二个文件应命中主机缓存直接流式: {logs2:?}"
+    assert_eq!(
+        server.range_requests(),
+        ranges_before,
+        "同主机第二个文件不应再发 Range 请求（缓存应已翻转为不支持分片）"
+    );
+    assert_eq!(
+        server.head_requests(),
+        0,
+        "新契约下不应为每个文件单独发 HEAD 探测"
     );
 
     m.shutdown().await;
@@ -637,18 +662,22 @@ async fn retry_after_failure_recovers() {
         wait_state(&m, id, TaskState::Failed, Duration::from_secs(20)).await,
         TaskState::Failed
     );
-    assert!(
-        server.flaky_requests() >= 2,
-        "失败任务应至少经历 2 次 GET（段 + 降级流式）"
+    // 新契约：探测已并入下载请求，失败阶段只消耗 1 次 GET（max_retries=0 时不重试）。
+    assert_eq!(
+        server.flaky_requests(),
+        1,
+        "max_retries=0 时只应尝试 1 次 GET（不再有额外的探测请求）"
     );
+    assert_eq!(server.head_requests(), 0, "不应发 HEAD 探测");
 
     m.retry(id).await.unwrap();
     assert_eq!(m.state(id).await.unwrap(), TaskState::Queued);
-    // 服务器前 5 次 GET 失败；失败阶段已消耗 2 次，需 retry 若干次直到恢复
+    // 服务器前 5 次 GET 失败；失败阶段已消耗 1 次，需 retry 若干次直到恢复。
+    // 每次只轮询到「终态」而不是死等 Completed——否则每轮固定耗掉整个超时窗口。
     let mut recovered = false;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(10)).await;
+        let st = wait_terminal(&m, id, Duration::from_secs(10)).await;
         if st == TaskState::Completed {
             recovered = true;
             break;
@@ -931,6 +960,119 @@ async fn chunked_non_empty_still_succeeds() {
         *server.data,
         "chunked 内容应完整"
     );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ================= 新契约回归测试 =================
+
+/// 回归（本次修复）：小文件必须只发 1 个请求。
+///
+/// 旧实现每个文件固定「HEAD 探测 + GET」两个请求（mock 统计每文件请求数 = 2.00）。
+/// 大量小文件场景下请求数翻倍，真实网络实测引擎吞吐只有裸 GET 的约 60%。
+#[tokio::test]
+async fn small_file_uses_single_request_no_head() {
+    let server = MockServer::start(8 * 1024, Behavior::default()).await;
+    let dir = tmp_dir("single-req");
+    let dest = dir.join("s.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    assert_eq!(server.head_requests(), 0, "不应再为小文件单独发 HEAD 探测");
+    assert_eq!(server.plain_gets(), 1, "小文件应恰好 1 个 GET");
+    assert_eq!(
+        server.range_requests(),
+        0,
+        "小文件（低于 split_threshold）不应走分片"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 只回响应头、永不发送 body 的本地服务：模拟「挂起的镜像节点」。
+///
+/// 实测故障形态：`mirror.lenmei233.dpdns.org` 回 200 + Content-Length 后 body
+/// 一直不来（客户端 60s 超时），导致每个文件都要等一轮重试预算。
+async fn spawn_stall_forever(hits: std::sync::Arc<std::sync::atomic::AtomicU32>) -> String {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let hits = hits.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                if stream.read(&mut buf).await.is_err() {
+                    return;
+                }
+                hits.fetch_add(1, Ordering::Relaxed);
+                // 无论 HEAD/GET 都只给头，body 永不到达。
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// 回归（本次修复）：主源「挂起且一个字节都不给」时必须立即换源，
+/// 而不是在它身上耗尽 `max_retries × watchdog_idle_timeout`。
+///
+/// 旧实现实测：`max_retries=5` + `idle=30s` 时单个文件要卡约 5 分钟才轮到
+/// 可用镜像。修复后只应付出一次看门狗周期。
+#[tokio::test]
+async fn dead_source_without_bytes_switches_immediately() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let dead_hits = Arc::new(AtomicU32::new(0));
+    let dead = spawn_stall_forever(dead_hits.clone()).await;
+    let alive = MockServer::start(32 * 1024, Behavior::default()).await;
+
+    let dir = tmp_dir("dead-src");
+    let dest = dir.join("d.bin");
+    let mut opts = fast_opts();
+    // 默认 5 次重试、1s 看门狗：旧实现约 2×5×1=10s 才换源。
+    opts.max_retries = 5;
+    opts.watchdog_idle_timeout = Duration::from_secs(1);
+    let m = DownloadManager::new(opts, 2);
+
+    let start = Instant::now();
+    let id = m.add(
+        DownloadTask::new(format!("{dead}/file"), dest.clone())
+            .with_mirrors(vec![alive.url("file")]),
+    );
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed,
+        "应切换到可用镜像并完成"
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(std::fs::read(&dest).unwrap(), *alive.data);
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "死源应在一个看门狗周期内被切换，实测耗时 {elapsed:?}（旧实现约 10s）"
+    );
+    assert!(
+        dead_hits.load(Ordering::Relaxed) <= 2,
+        "死源只应被试探 1~2 次，实测 {} 次",
+        dead_hits.load(Ordering::Relaxed)
+    );
+
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

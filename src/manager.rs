@@ -4,7 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -58,6 +58,9 @@ struct Inner {
     /// 按宿主的探测结果缓存（host → 支持 Range？）。同一 CDN 主机的大量小文件
     /// 只探测一次，后续任务直接下载，避免每个文件一次 HEAD（Java 启动器同款行为）。
     host_probe: Arc<StdRwLock<HashMap<String, bool>>>,
+    /// 已知在拉黑期内的宿主（host → 发现时刻）。任务启动时把它们的镜像排到最后，
+    /// 避免同一批文件里每个都去撞同一个挂掉的源。
+    host_dead: Arc<StdMutex<HashMap<String, Instant>>>,
     /// 全局进度聚合任务。
     aggregator: StdMutex<Option<JoinHandle<()>>>,
     /// 队列派发任务。
@@ -83,6 +86,7 @@ impl DownloadManager {
             h3,
             dispatch: Arc::new(Notify::new()),
             host_probe: Arc::new(StdRwLock::new(HashMap::new())),
+            host_dead: Arc::new(StdMutex::new(HashMap::new())),
             aggregator: StdMutex::new(None),
             dispatcher: StdMutex::new(None),
         });
@@ -477,6 +481,15 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
     let mut urls = Vec::with_capacity(entry.task.mirror_urls.len() + 1);
     urls.push(entry.task.url.clone());
     urls.extend(entry.task.mirror_urls.clone());
+    // 已知挂掉的源排到最后（稳定排序保留其余相对顺序）：同一批小文件里
+    // 不必每个文件都先去撞同一个死源、等一轮看门狗。
+    {
+        let dead = inner.host_dead.lock().unwrap();
+        urls.sort_by_key(|u| {
+            dead.get(&crate::engine::host_of(u))
+                .is_some_and(|at| at.elapsed() < crate::engine::DEAD_HOST_TTL)
+        });
+    }
 
     // 按来源路由传输协议：限速 CDN（Modrinth 等）走 HTTP/1.1 并行，其余走 HTTP/2/3。
     let host = crate::engine::host_of(&urls[0]);
@@ -503,6 +516,8 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         use_h1: AtomicBool::new(use_h1),
         use_h3: AtomicBool::new(inner.h3.is_some() && !use_h1),
         host_probe: inner.host_probe.clone(),
+        dead_hosts: inner.host_dead.clone(),
+        ranged_attempted: AtomicBool::new(false),
     });
 
     let result = inner.engine.run(&ctx).await;

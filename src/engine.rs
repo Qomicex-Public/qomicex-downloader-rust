@@ -60,9 +60,34 @@ pub(crate) struct RunContext {
     /// 按宿主的探测结果缓存（host → 支持 Range？）。跨任务共享，避免同主机大量
     /// 小文件逐文件 HEAD 探测。
     pub host_probe: Arc<std::sync::RwLock<HashMap<String, bool>>>,
+    /// 已知不可用/挂起的宿主（host → 发现时刻）。跨任务共享：一个源在某文件上
+    /// 一个字节都没给出来，后续文件直接把它排到最后，不必每个文件都再等一轮
+    /// 看门狗。TTL 到期自动恢复尝试，避免源只是短暂抖动就被永久拉黑。
+    pub dead_hosts: Arc<StdMutex<HashMap<String, Instant>>>,
+    /// 本次尝试是否已经因「文件够大且支持 Range」切过分片。
+    ///
+    /// 防止 `run_ranged` 降级整文件 → `run_streamed` 再嗅探 → 又切回分片
+    /// 的死循环。每次 `run_once` 重置。
+    pub ranged_attempted: AtomicBool,
 }
 
+/// 死源拉黑时长。短于常见 CDN 抖动恢复时间，又足够让同一批大量小文件跳过它。
+pub(crate) const DEAD_HOST_TTL: Duration = Duration::from_secs(120);
+
 impl RunContext {
+    /// 拉黑宿主（本次任务在该源上一个字节都没拿到）。
+    pub(crate) fn mark_host_dead(&self, host: &str) {
+        self.dead_hosts
+            .lock()
+            .unwrap()
+            .insert(host.to_string(), Instant::now());
+    }
+
+    /// 宿主成功交付过数据 → 解除拉黑。
+    pub(crate) fn mark_host_alive(&self, host: &str) {
+        self.dead_hosts.lock().unwrap().remove(host);
+    }
+
     /// 本次尝试应当使用的 URL：优先用探测解析后的真实地址。
     pub(crate) fn current_url(&self) -> String {
         if let Some(u) = self.resolved_url.lock().unwrap().as_ref() {
@@ -83,6 +108,11 @@ impl RunContext {
 
     pub(crate) fn clear_resolved_url(&self) {
         *self.resolved_url.lock().unwrap() = None;
+    }
+
+    /// 是否还有别的镜像可换。
+    pub(crate) fn has_other_url(&self) -> bool {
+        self.urls.lock().unwrap().len() > 1
     }
 
     /// 轮换到下一个镜像，返回新 URL（无镜像返回 None）。
@@ -150,13 +180,6 @@ where
 
 pub(crate) struct Engine;
 
-struct ProbeResult {
-    total: Option<u64>,
-    range_ok: bool,
-    /// 跟随重定向后实际应答的 URL（可能与请求的 URL 不同）。
-    effective_url: String,
-}
-
 /// 段失败类别。
 enum SegFailure {
     Cancelled,
@@ -205,174 +228,23 @@ impl Engine {
         let part = ctx.task.part_path();
         // 每次尝试都重新解析：上一轮的落地地址可能已失效，且换镜像后必须重新探测。
         ctx.clear_resolved_url();
-        let host = host_of(&ctx.current_url());
+        ctx.ranged_attempted.store(false, Ordering::Relaxed);
 
-        // 探测缓存：同一 CDN 主机第一个文件才做网络探测（HEAD），后续文件按文件大小
-        // 决定是否跳过探测。原实现〔commit 5561263〕对所有缓存命中文件一律单连接流式
-        // （`run_streamed`），把大文件（整合包包体/大 mod）也打成单连接，吞吐仅一线，
-        // 慢 CDN 上表现为 ~100KB/s 且易触发上层下载超时；改为在主机支持 Range 时用轻量
-        // HEAD 拿文件大小，够大仍走多段并行（`run_ranged`），小文件保留单连接直传。
-        let cached_range_ok = ctx.host_probe.read().unwrap().get(&host).copied();
-        if let Some(range_ok) = cached_range_ok {
-            if !range_ok {
-                // 主机不支持 Range：无法分片并行，无论大小都单连接流式（保持跳过探测）
-                ctx.log(
-                    LogLevel::Info,
-                    format!("host {host} 不支持 Range，跳过探测直接下载"),
-                );
-                ctx.stats.total.store(0, Ordering::Relaxed);
-                return self.run_streamed(ctx, &part).await;
+        // 不再单独发 HEAD：直接 GET，从**响应头**决定走流式还是分片。
+        // 旧实现每个文件固定「HEAD + GET」两个请求（实测每文件请求数 = 2.00），
+        // 小文件批量下载时等于把请求数翻倍；这里把判定合并进下载请求本身，
+        // 文件不需要知道大小也能直接开始收字节。
+        match self.run_streamed(ctx, &part).await {
+            Err(DownloadError::NeedsRanged(total)) => {
+                // 已经看过响应头（含重定向落地地址），放弃这段流、改走分片。
+                ctx.ranged_attempted.store(true, Ordering::Relaxed);
+                self.run_ranged(ctx, &part, total).await
             }
-            // Range 可用：轻量 HEAD 拿大小，够大则多段并行，小文件单连接直传。
-            ctx.log(
-                LogLevel::Info,
-                format!("host {host} 已缓存，按文件大小分流"),
-            );
-            if let Some(total) = self.cached_size(ctx).await {
-                if total > ctx.options.split_threshold {
-                    ctx.stats.total.store(total, Ordering::Relaxed);
-                    return self.run_ranged(ctx, &part, total).await;
-                }
-            }
-            ctx.stats.total.store(0, Ordering::Relaxed);
-            return self.run_streamed(ctx, &part).await;
-        }
-
-        let probe = self.probe(ctx).await?;
-        // 探测成功后缓存该主机的 Range 支持情况
-        ctx.host_probe.write().unwrap().insert(host, probe.range_ok);
-        ctx.set_resolved_url(&probe.effective_url);
-        let resolved = ctx.current_url();
-        ctx.log(
-            LogLevel::Info,
-            format!(
-                "探测完成: total={:?}, range={}, url={}",
-                probe.total, probe.range_ok, resolved
-            ),
-        );
-        match probe.total {
-            Some(t) if t > 0 => {
-                ctx.stats.total.store(t, Ordering::Relaxed);
-                if probe.range_ok {
-                    return self.run_ranged(ctx, &part, t).await;
-                }
-                self.run_streamed(ctx, &part).await
-            }
-            // `Some(0)`（服务器明确声明 0 字节）与 `None`（无 Content-Length，大小未知）
-            // 都送流式路径：空体的判定统一放在 `try_streamed_once` 的 EOF 处（唯一钳位点），
-            // 这样顺带获得流式路径的重试 + 镜像轮换——主镜像回空体时会自动换下一个，
-            // 而不是在 `run_once` 里直接失败、错过可用的备选节点。
-            _ => {
-                ctx.stats.total.store(0, Ordering::Relaxed);
-                self.run_streamed(ctx, &part).await
-            }
-        }
-    }
-
-    // ---------------- 探测 ----------------
-
-    async fn probe(&self, ctx: &Arc<RunContext>) -> Result<ProbeResult, DownloadError> {
-        let mut last_err: Option<DownloadError> = None;
-        let url_count = ctx.urls.lock().unwrap().len();
-        for _ in 0..url_count {
-            let url = ctx.current_url();
-            match self.probe_one(ctx, &url).await {
-                Ok(p) => return Ok(p),
-                Err(e) => {
-                    ctx.log(LogLevel::Warn, format!("探测 {url} 失败: {e}"));
-                    last_err = Some(e);
-                    if ctx.mirror_url().is_none() {
-                        break;
-                    }
-                }
-            }
-        }
-        Err(last_err.unwrap_or(DownloadError::Exhausted("无可用 URL".into())))
-    }
-
-    async fn probe_one(
-        &self,
-        ctx: &Arc<RunContext>,
-        url: &str,
-    ) -> Result<ProbeResult, DownloadError> {
-        let timeout = ctx.options.timeout;
-        let head = send_with_fallback(ctx, |client| {
-            client
-                .head(url)
-                .headers(ctx.headers.clone())
-                .timeout(timeout)
-                .send()
-        })
-        .await;
-        if let Ok(resp) = head {
-            let status = resp.status();
-            if status.is_success() {
-                return Ok(ProbeResult {
-                    total: content_length(resp.headers()),
-                    range_ok: accept_ranges_bytes(resp.headers()),
-                    effective_url: resp.url().to_string(),
-                });
-            }
-            if status.is_server_error() {
-                return Err(DownloadError::HttpStatus {
-                    status: status.as_u16(),
-                    url: url.to_string(),
-                });
-            }
-        }
-        let resp = send_with_fallback(ctx, |client| {
-            client
-                .get(url)
-                .headers(ctx.headers.clone())
-                .header(reqwest::header::RANGE, "bytes=0-0")
-                .timeout(timeout)
-                .send()
-        })
-        .await?;
-        let status = resp.status();
-        let effective_url = resp.url().to_string();
-        if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            Ok(ProbeResult {
-                total: content_range_total(resp.headers()),
-                range_ok: true,
-                effective_url,
-            })
-        } else if status.is_success() {
-            Ok(ProbeResult {
-                total: content_length(resp.headers()),
-                range_ok: false,
-                effective_url,
-            })
-        } else {
-            Err(DownloadError::HttpStatus {
-                status: status.as_u16(),
-                url: url.to_string(),
-            })
+            other => other,
         }
     }
 
     // ---------------- Range 多段路径 ----------------
-
-    /// 缓存命中且主机支持 Range 时，用轻量 HEAD 获取文件大小，并记录跟随重定向后的
-    /// 真实地址（供 `run_ranged` 的分段 Range 请求使用，绕开纯重定向器对 Range 的 404）。
-    /// 返回文件大小；任何失败（连不上/无 Content-Length）返回 None，调用方退化为单连接流式。
-    async fn cached_size(&self, ctx: &Arc<RunContext>) -> Option<u64> {
-        let url = ctx.current_url();
-        let resp = send_with_fallback(ctx, |client| {
-            client
-                .head(url.clone())
-                .headers(ctx.headers.clone())
-                .timeout(ctx.options.timeout)
-                .send()
-        })
-        .await
-        .ok()?;
-        let resp = resp.error_for_status().ok()?;
-        let total = content_length(resp.headers())?;
-        // 记录最终落地地址，供分段请求使用
-        ctx.set_resolved_url(resp.url().as_str());
-        Some(total)
-    }
 
     async fn run_ranged(
         &self,
@@ -561,8 +433,29 @@ impl Engine {
                     Ok(()) => {
                         return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await
                     }
+                    // 响应头表明该走分片：交给 run_once 处理，不算失败、不计重试。
+                    Err(e @ DownloadError::NeedsRanged(_)) => return Err(e),
                     Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
                     Err(e) => {
+                        // 快速失败：本次尝试一个字节都没收到 → 这个源是死的（挂起/截断），
+                        // 先把该宿主拉黑并立刻换源，而不是在同一源上把重试预算烧完。
+                        // 旧实现要耗尽 max_retries × idle 才轮换：默认 5×30s，实测单文件
+                        // 约 5 分钟才用上可用镜像。
+                        let got_bytes = ctx.stats.downloaded.load(Ordering::Relaxed) > 0;
+                        if !got_bytes {
+                            ctx.mark_host_dead(&host_of(&url));
+                        }
+                        if !got_bytes && ctx.has_other_url() {
+                            if let Some(next) = ctx.mirror_url() {
+                                attempt = 0;
+                                url = next;
+                                ctx.log(
+                                    LogLevel::Warn,
+                                    format!("源 {url} 未返回数据，立即切换镜像"),
+                                );
+                                continue;
+                            }
+                        }
                         attempt += 1;
                         if attempt > max_retries {
                             match ctx.mirror_url() {
@@ -623,6 +516,23 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                 );
             }
             Err(SegError::Retryable(reason)) => {
+                // 快速失败：这一段在本源上一个字节都没拿到 → 源是死的，立刻换源，
+                // 不在同一源上耗尽重试预算（默认 5 次 × 看门狗 30s）。
+                let progressed = seg.downloaded.load(Ordering::Relaxed) > 0;
+                if !progressed {
+                    ctx.mark_host_dead(&host_of(&attempt_url));
+                    if ctx.has_other_url() {
+                        if let Some(next) = ctx.mirror_url() {
+                            attempt = 0;
+                            attempt_url = next;
+                            ctx.log(
+                                LogLevel::Warn,
+                                format!("段 {idx}: 源无响应，立即切换镜像 {attempt_url}"),
+                            );
+                            continue;
+                        }
+                    }
+                }
                 attempt += 1;
                 if attempt > max_retries {
                     match ctx.mirror_url() {
@@ -737,6 +647,7 @@ async fn try_segment_once(
                         file.sync_data().await
                             .map_err(|e| SegError::Retryable(e.to_string()))?;
                         if seg.finished() {
+                            ctx.mark_host_alive(&host_of(url));
                             return Ok(());
                         }
                         let got = seg.downloaded.load(Ordering::Relaxed);
@@ -806,6 +717,45 @@ async fn try_streamed_once(
             url: url.to_string(),
         });
     }
+
+    // 用响应头完成原来 HEAD 探测承担的两件事：
+    //   1. 记录跟随重定向后的真实地址（纯重定向器对带 Range 的请求会报错，
+    //      分段必须用落地地址，见 `resolved_url` 字段注释）；
+    //   2. 缓存该宿主是否支持 Range，供后续同主机文件复用判定。
+    ctx.set_resolved_url(resp.url().as_str());
+    let host = host_of(url);
+    let cached_range = ctx.host_probe.read().unwrap().get(&host).copied();
+    let header_range_ok = accept_ranges_bytes(resp.headers());
+    // 只在没有既有结论时写入：`try_segment_once` 发现「谎报 Range」会把缓存翻成
+    // false，若这里再按响应头写回 true，同主机每个文件都会重新撞一次分片。
+    if cached_range.is_none() {
+        ctx.host_probe
+            .write()
+            .unwrap()
+            .insert(host.clone(), header_range_ok);
+    }
+    let range_ok = cached_range.unwrap_or(header_range_ok);
+    let total = content_length(resp.headers());
+    if let Some(t) = total {
+        ctx.stats.total.store(t, Ordering::Relaxed);
+    }
+
+    // 文件够大且源支持 Range → 放弃这段流改走分片（多连接并行）。
+    // 仅在本次尝试还没进入过分片时触发一次，避免与 `run_ranged` 的降级互相弹跳。
+    if range_ok
+        && !ctx.ranged_attempted.load(Ordering::Relaxed)
+        && total.is_some_and(|t| t > ctx.options.split_threshold)
+    {
+        ctx.log(
+            LogLevel::Info,
+            format!(
+                "响应头判定为大文件（{} 字节）且支持 Range，改走分片",
+                total.unwrap_or(0)
+            ),
+        );
+        return Err(DownloadError::NeedsRanged(total.unwrap_or(0)));
+    }
+
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -844,6 +794,8 @@ async fn try_streamed_once(
                         if total > 0 && downloaded != total {
                             return Err(DownloadError::Incomplete { expected: total, actual: downloaded });
                         }
+                        // 该源确实交付了完整数据：解除可能存在的拉黑。
+                        ctx.mark_host_alive(&host_of(url));
                         return Ok(());
                     }
                 }
@@ -964,12 +916,6 @@ fn accept_ranges_bytes(headers: &reqwest::header::HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_ascii_lowercase().contains("bytes"))
         .unwrap_or(false)
-}
-
-fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let v = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
-    let total = v.rsplit('/').next()?;
-    total.parse().ok()
 }
 
 /// 原子完成：fsync + rename（目标已存在时先删，兼容 Windows）。

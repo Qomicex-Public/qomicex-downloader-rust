@@ -52,6 +52,10 @@ pub struct MockServer {
     handle: JoinHandle<()>,
     flaky_count: Arc<AtomicU32>,
     conn_count: Arc<AtomicU32>,
+    /// 请求方法计数：用于断言「每文件请求数」这类契约（是否发 HEAD、是否走分片）。
+    head_count: Arc<AtomicU32>,
+    get_count: Arc<AtomicU32>,
+    range_count: Arc<AtomicU32>,
 }
 
 impl MockServer {
@@ -61,12 +65,18 @@ impl MockServer {
         let addr = listener.local_addr().unwrap();
         let flaky_count = Arc::new(AtomicU32::new(0));
         let conn_count = Arc::new(AtomicU32::new(0));
+        let head_count = Arc::new(AtomicU32::new(0));
+        let get_count = Arc::new(AtomicU32::new(0));
+        let range_count = Arc::new(AtomicU32::new(0));
         let handle = tokio::spawn(accept_loop(
             listener,
             data.clone(),
             behavior,
             flaky_count.clone(),
             conn_count.clone(),
+            head_count.clone(),
+            get_count.clone(),
+            range_count.clone(),
         ));
         Self {
             addr,
@@ -74,6 +84,9 @@ impl MockServer {
             handle,
             flaky_count,
             conn_count,
+            head_count,
+            get_count,
+            range_count,
         }
     }
 
@@ -84,14 +97,33 @@ impl MockServer {
     pub fn flaky_requests(&self) -> u32 {
         self.flaky_count.load(Ordering::Relaxed)
     }
+
+    /// HEAD 请求数。新契约下应为 0：不再为每个文件单独发探测请求。
+    pub fn head_requests(&self) -> u32 {
+        self.head_count.load(Ordering::Relaxed)
+    }
+
+    /// 不带 Range 的 GET 数。
+    pub fn plain_gets(&self) -> u32 {
+        self.get_count.load(Ordering::Relaxed)
+    }
+
+    /// 带 Range 的 GET 数。
+    pub fn range_requests(&self) -> u32 {
+        self.range_count.load(Ordering::Relaxed)
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
     data: Arc<Vec<u8>>,
     behavior: Behavior,
     flaky_count: Arc<AtomicU32>,
     conn_count: Arc<AtomicU32>,
+    head_count: Arc<AtomicU32>,
+    get_count: Arc<AtomicU32>,
+    range_count: Arc<AtomicU32>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -101,18 +133,25 @@ async fn accept_loop(
         let behavior = behavior.clone();
         let fc = flaky_count.clone();
         let cc = conn_count.clone();
+        let hc = head_count.clone();
+        let gc = get_count.clone();
+        let rc = range_count.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(stream, data, behavior, fc, cc).await;
+            let _ = handle_conn(stream, data, behavior, fc, cc, hc, gc, rc).await;
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn(
     mut stream: TcpStream,
     data: Arc<Vec<u8>>,
     behavior: Behavior,
     flaky_count: Arc<AtomicU32>,
     conn_count: Arc<AtomicU32>,
+    head_count: Arc<AtomicU32>,
+    get_count: Arc<AtomicU32>,
+    range_count: Arc<AtomicU32>,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
@@ -140,6 +179,19 @@ async fn handle_conn(
         }
     }
     let range = headers.get("range").cloned();
+    match method.as_str() {
+        "HEAD" => {
+            head_count.fetch_add(1, Ordering::Relaxed);
+        }
+        "GET" => {
+            if range.is_some() {
+                range_count.fetch_add(1, Ordering::Relaxed);
+            } else {
+                get_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        _ => {}
+    }
 
     // `/redirect` 模拟纯重定向器：无 Range 时 302 到真实文件，带 Range 时直接 404。
     // 这是 CurseForge edge.forgecdn.net 的真实行为（它 302 到 mediafilez，但对

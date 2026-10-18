@@ -49,6 +49,11 @@ pub enum DownloadError {
     #[error("所有重试均已耗尽: {0}")]
     Exhausted(String),
 
+    /// 内部信号：响应头表明文件较大且源支持 Range，应改走分片。
+    /// 只在 engine 内部流转，不会作为任务终态冒到上层。
+    #[error("改走分片下载（{0} 字节）")]
+    NeedsRanged(u64),
+
     /// 其他错误（状态机非法转移等）。
     #[error("{0}")]
     Other(String),
