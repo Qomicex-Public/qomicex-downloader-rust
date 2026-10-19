@@ -49,6 +49,8 @@ struct Inner {
     semaphore: Arc<Semaphore>,
     /// 全局段许可：聚合连接数的硬上限（issue #5）。
     segment_sem: Arc<Semaphore>,
+    /// 全局限速（None = 不限速）。
+    limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
     engine: Engine,
     /// HTTP/2 客户端（常备；非限速源默认走它）。
     h2: reqwest::Client,
@@ -89,6 +91,9 @@ impl DownloadManager {
             };
         let (h2, h1, h3) = build_clients(&options, max_concurrent, ip_health.clone());
         let segment_permits = options.max_total_segments.max(1) as usize;
+        let limiter = options
+            .max_download_speed
+            .map(|bps| Arc::new(crate::rate_limit::RateLimiter::new(bps)));
         let inner = Arc::new(Inner {
             options,
             events,
@@ -97,6 +102,7 @@ impl DownloadManager {
             next_id: AtomicU64::new(1),
             semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
             segment_sem: Arc::new(Semaphore::new(segment_permits)),
+            limiter,
             engine: Engine::new(),
             h2,
             h1,
@@ -608,6 +614,7 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         h3: inner.h3.clone(),
         use_h1: AtomicBool::new(use_h1),
         segment_sem: inner.segment_sem.clone(),
+        limiter: inner.limiter.clone(),
         use_h3: AtomicBool::new(inner.h3.is_some() && !use_h1),
         host_probe: inner.host_probe.clone(),
         dead_hosts: inner.host_dead.clone(),

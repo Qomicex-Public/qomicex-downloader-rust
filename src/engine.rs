@@ -31,6 +31,8 @@ pub(crate) struct DownloadStats {
 pub(crate) struct RunContext {
     /// 全局段许可（跨任务共享），限制聚合连接数（issue #5）。
     pub segment_sem: Arc<tokio::sync::Semaphore>,
+    /// 全局限速（None = 不限速），跨任务共享。
+    pub limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
     pub task: crate::task::DownloadTask,
     pub cancel: CancellationToken,
     pub events: Sender<DownloadEvent>,
@@ -927,6 +929,9 @@ async fn try_segment_once(
                             .map_err(|e| SegError::Retryable(e.to_string()))?;
                         seg.downloaded.fetch_add(take as u64, Ordering::Relaxed);
                         ctx.stats.downloaded.fetch_add(take as u64, Ordering::Relaxed);
+                        if let Some(l) = &ctx.limiter {
+                            l.acquire(take as u64).await;
+                        }
                         if take < bytes.len() {
                             return Err(SegError::Retryable(format!(
                                 "响应体超出段范围: 段剩余 {remaining} 字节，收到 {} 字节",
@@ -1078,6 +1083,9 @@ async fn try_streamed_once(
                     Some(Ok(bytes)) => {
                         file.write_all(&bytes).await?;
                         ctx.stats.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        if let Some(l) = &ctx.limiter {
+                            l.acquire(bytes.len() as u64).await;
+                        }
                         last_activity = Instant::now();
                     }
                     Some(Err(e)) => return Err(DownloadError::Http(e)),

@@ -1291,3 +1291,31 @@ async fn global_segment_limit_serializes_without_deadlock() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// issue #10：全局限速（令牌桶）对所有段共享，聚合速率不得超过上限。
+#[tokio::test]
+async fn global_rate_limit_caps_aggregate_speed() {
+    const TOTAL: usize = 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("global-rate");
+    let dest = dir.join("r.bin");
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    opts.max_download_speed = Some(512 * 1024);
+    let m = DownloadManager::new(opts, 1);
+    let start = std::time::Instant::now();
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "512 KiB/s 下 1 MiB 不应在 {elapsed:?} 内完成"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
