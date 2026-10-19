@@ -687,6 +687,17 @@ impl Engine {
                                 continue;
                             }
                         }
+                        // 流式路径每次尝试都从头写，换源没有续传代价：已经收到过字节
+                        // 但看门狗再次超时时也换源，避免在同一坏节点上耗完整个重试预算。
+                        let stalled = matches!(e, DownloadError::Exhausted(_));
+                        if stalled && ctx.has_other_url() {
+                            if let Some(next) = ctx.mirror_url() {
+                                attempt = 0;
+                                url = next;
+                                ctx.log(LogLevel::Warn, format!("连续无进展，切换镜像 {url}"));
+                                continue;
+                            }
+                        }
                         if !got_bytes {
                             ctx.mark_source_dead(&url);
                         }
