@@ -187,6 +187,12 @@ pub struct DownloadTask {
     pub segment_size: Option<u64>,
     /// 可选 SHA-256 校验和（下载完成后验证，不匹配自动重下一次）。
     pub sha256: Option<[u8; 32]>,
+    /// 可选的 SHA-1（Minecraft 仓库多用它）。与 `sha256` 至少给一个才能本地复用。
+    pub sha1: Option<[u8; 20]>,
+    /// 本地复用搜索目录（issue #11）：按摘要找到同内容文件后直接复制。
+    pub reuse_dirs: Vec<PathBuf>,
+    /// 已知文件大小；提供时可在联网探测前完成本地复用（0 次网络请求）。
+    pub expected_size: Option<u64>,
     /// 内部任务 ID（由 manager 分配）。
     pub(crate) id: TaskId,
 }
@@ -203,6 +209,9 @@ impl DownloadTask {
             max_retries: None,
             segment_size: None,
             sha256: None,
+            sha1: None,
+            reuse_dirs: Vec::new(),
+            expected_size: None,
             id: 0,
         }
     }
@@ -246,6 +255,24 @@ impl DownloadTask {
     /// 设置 SHA-256 校验和（64 位十六进制字符串，无效则忽略）。
     pub fn with_sha256_hex(mut self, hex: &str) -> Self {
         self.sha256 = parse_hex_sha256(hex);
+        self
+    }
+
+    /// 设置 SHA-1 校验和（用于本地复用与内容识别）。
+    pub fn with_sha1(mut self, sha1: [u8; 20]) -> Self {
+        self.sha1 = Some(sha1);
+        self
+    }
+
+    /// 设置本地复用搜索目录（issue #11）。
+    pub fn with_reuse_dirs(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.reuse_dirs = dirs.into_iter().collect();
+        self
+    }
+
+    /// 声明已知文件大小：可在联网探测前直接复用本地文件。
+    pub fn with_expected_size(mut self, size: u64) -> Self {
+        self.expected_size = Some(size);
         self
     }
 

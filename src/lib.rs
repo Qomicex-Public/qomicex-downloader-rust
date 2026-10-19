@@ -78,6 +78,7 @@ pub mod task;
 
 pub mod dns;
 mod engine;
+mod local_reuse;
 mod part_meta;
 mod rate_limit;
 mod segment;

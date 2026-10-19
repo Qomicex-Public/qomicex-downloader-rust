@@ -349,6 +349,12 @@ impl Engine {
     }
 
     async fn run_once(&self, ctx: &Arc<RunContext>) -> Result<(), DownloadError> {
+        // 已知大小且本地已有同内容文件：直接复制，不发起任何网络请求（issue #11）。
+        if let Some(size) = ctx.task.expected_size {
+            if try_local_reuse(ctx, size).await? {
+                return Ok(());
+            }
+        }
         let part = ctx.task.part_path();
         // 每次尝试都重新解析：上一轮的落地地址可能已失效，且换镜像后必须重新探测。
         ctx.clear_resolved_url();
@@ -362,6 +368,9 @@ impl Engine {
             Err(DownloadError::NeedsRanged(total)) => {
                 // 已经看过响应头（含重定向落地地址），放弃这段流、改走分片。
                 ctx.ranged_attempted.store(true, Ordering::Relaxed);
+                if try_local_reuse(ctx, total).await? {
+                    return Ok(());
+                }
                 self.run_ranged(ctx, &part, total).await
             }
             other => other,
@@ -1145,6 +1154,39 @@ fn refresh_bitmap(meta: &mut crate::part_meta::PartMeta, segments: &HashMap<u32,
             .sum();
         meta.set_complete(block, covered == b1 - b0);
     }
+}
+/// 本地复用：按摘要找到同内容文件后复制到 `.part`，再走最终校验/rename（issue #11）。
+///
+/// 复制后仍调用 `finalize_verified`：命中只说明大小与摘要一致，最终校验不能省。
+async fn try_local_reuse(ctx: &Arc<RunContext>, size: u64) -> Result<bool, DownloadError> {
+    if ctx.task.reuse_dirs.is_empty() || (ctx.task.sha256.is_none() && ctx.task.sha1.is_none()) {
+        return Ok(false);
+    }
+    let dirs = ctx.task.reuse_dirs.clone();
+    let sha256 = ctx.task.sha256;
+    let sha1 = ctx.task.sha1;
+    let found = tokio::task::spawn_blocking(move || {
+        crate::local_reuse::find_match(&dirs, size, sha256, sha1)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(src) = found else {
+        return Ok(false);
+    };
+    let part = ctx.task.part_path();
+    if let Some(parent) = part.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::copy(&src, &part).await?;
+    ctx.stats.total.store(size, Ordering::Relaxed);
+    ctx.stats.downloaded.store(size, Ordering::Relaxed);
+    finalize_verified(&part, &ctx.task.dest, ctx.task.sha256).await?;
+    ctx.log(
+        LogLevel::Info,
+        format!("本地复用: {} -> {}", src.display(), ctx.task.dest.display()),
+    );
+    Ok(true)
 }
 /// 目标盘空间预检（issue #9）。
 ///

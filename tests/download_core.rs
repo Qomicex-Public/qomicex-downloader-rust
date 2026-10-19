@@ -1319,3 +1319,123 @@ async fn global_rate_limit_caps_aggregate_speed() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// issue #11：已知大小 + 摘要命中本地文件时直接复制，完全不走网络。
+#[tokio::test]
+async fn local_reuse_hit_makes_no_network_request() {
+    const TOTAL: usize = 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("reuse-hit");
+    let src_dir = dir.join("libraries");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("same.jar"), &server.data[..]).unwrap();
+
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, &server.data[..]);
+    let digest: [u8; 32] = sha2::Digest::finalize(hasher).into();
+
+    let dest = dir.join("out.jar");
+    let task = DownloadTask::new(server.url("file"), dest.clone())
+        .with_sha256(digest)
+        .with_expected_size(TOTAL as u64)
+        .with_reuse_dirs([src_dir.clone()]);
+    let m = DownloadManager::new(fast_opts(), 1);
+    let id = m.add(task);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    assert_eq!(
+        server.head_requests() + server.plain_gets() + server.range_requests(),
+        0,
+        "本地复用命中时不得发起网络请求"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #11：未声明大小时，探测拿到 total 后仍可复用（不再下载 body）。
+#[tokio::test]
+async fn local_reuse_without_expected_size_still_copies() {
+    const TOTAL: usize = 512 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("reuse-after-probe");
+    let src_dir = dir.join("mods");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("same.jar"), &server.data[..]).unwrap();
+
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, &server.data[..]);
+    let digest: [u8; 32] = sha2::Digest::finalize(hasher).into();
+
+    let dest = dir.join("out.jar");
+    let task = DownloadTask::new(server.url("file"), dest.clone())
+        .with_sha256(digest)
+        .with_reuse_dirs([src_dir.clone()]);
+    let m = DownloadManager::new(fast_opts(), 1);
+    let id = m.add(task);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #7 / #12：404 立即换镜像，不在坏源上耗尽重试预算。
+#[tokio::test]
+async fn http_404_switches_mirror_without_retry_storm() {
+    const TOTAL: usize = 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("404-mirror");
+    let dest = dir.join("ok.bin");
+    let task =
+        DownloadTask::new(server.url("status404"), dest.clone()).with_mirrors([server.url("file")]);
+    let m = DownloadManager::new(fast_opts(), 1);
+    let id = m.add(task);
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    assert!(
+        server.plain_gets() <= 3,
+        "404 后应立即换源，实际发出 {} 次普通 GET",
+        server.plain_gets()
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #7 / #12：429 的 Retry-After 必须被遵守（而不是用默认退避猛打）。
+#[tokio::test]
+async fn http_429_honors_retry_after() {
+    const TOTAL: usize = 256 * 1024;
+    let server = MockServer::start(
+        TOTAL,
+        Behavior {
+            retry_after: Some((1, 1)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("retry-after");
+    let dest = dir.join("r.bin");
+    let m = DownloadManager::new(fast_opts(), 1);
+    let start = std::time::Instant::now();
+    let id = m.add(DownloadTask::new(server.url("retry429"), dest.clone()));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await,
+        TaskState::Completed
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "Retry-After: 1 应至少等待 0.9s，实际 {elapsed:?}"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

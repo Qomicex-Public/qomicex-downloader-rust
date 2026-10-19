@@ -47,6 +47,8 @@ pub struct Behavior {
     /// 206 响应的 `Content-Range` 始终从 0 开始（与请求区间不符），
     /// 模拟异常 CDN / 中间层篡改响应头。用于验证段写入不会越界污染相邻段。
     pub bad_content_range: bool,
+    /// `/retry429` 前 N 次 GET 返回 429（带 Retry-After: 秒），用于验证限流退避。
+    pub retry_after: Option<(u64, u32)>,
 }
 
 pub struct MockServer {
@@ -207,6 +209,23 @@ async fn handle_conn(
             "HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         };
         return write_response(&mut stream, resp.as_bytes(), &[], None).await;
+    }
+
+    if path == "/retry429" && method == "GET" {
+        let (secs, times) = behavior.retry_after.unwrap_or((0, 0));
+        let count = flaky_count.fetch_add(1, Ordering::Relaxed);
+        if count < times {
+            return write_response(
+                &mut stream,
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {secs}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+                &[],
+                None,
+            )
+            .await;
+        }
     }
 
     if path == "/status404" || behavior.status404 {
