@@ -1076,3 +1076,246 @@ async fn dead_source_without_bytes_switches_immediately() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ================= issue #2/#3/#4 回归 =================
+
+/// issue #3：服务器 206 谎报 Content-Range 起点时，绝不能把响应体写进相邻段。
+/// 分段路径应判定为源不可信 → 降级整文件流式，最终内容仍需逐字节一致。
+#[tokio::test]
+async fn bad_content_range_never_corrupts_neighbor_segments() {
+    let server = MockServer::start(
+        2 * 1024 * 1024,
+        Behavior {
+            bad_content_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("bad-cr");
+    let dest = dir.join("b.bin");
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed,
+        "应降级整文件完成"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "Content-Range 与请求不符时不得写越界（issue #3）"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #4：两个任务指向同一 dest 时，第二个必须明确失败，而不是并发写同一个 .part。
+#[tokio::test]
+async fn same_dest_concurrent_task_is_rejected() {
+    let server = MockServer::start(
+        1024 * 1024,
+        Behavior {
+            throttle: Some((256 * 1024, 256 * 1024)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("dest-lock");
+    let dest = dir.join("same.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let id1 = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    // 等第一个任务真正进入下载（占用 dest）后再加第二个。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let id2 = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id2, TaskState::Failed, Duration::from_secs(10)).await,
+        TaskState::Failed,
+        "同 dest 的第二个任务必须明确失败"
+    );
+    assert_eq!(
+        wait_state(&m, id1, TaskState::Completed, Duration::from_secs(60)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "文件内容不得被交错写入"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #2：多段续传时 .part 大小只是最高水位，不能据此推断各段已下载量。
+/// 预置一个「满大小但内容错误」的 .part，修复后必须丢弃重下；修复前会把
+/// 零字节内容当成下载完成（长度一致即通过校验）。
+#[tokio::test]
+async fn multisegment_resume_with_holes_is_discarded() {
+    let server = MockServer::start(2 * 1024 * 1024, Behavior::default()).await;
+    let dir = tmp_dir("hole-resume");
+    let dest = dir.join("h.bin");
+    let part = dest.with_file_name("h.bin.part");
+    std::fs::write(&part, vec![0u8; 2 * 1024 * 1024]).unwrap();
+
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "带洞 .part 不得被当成已完成（issue #2）"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #2 正式方案：带块级位图时，已完成块不再重下，且完成判定以位图为准。
+#[tokio::test]
+async fn bitmap_resume_keeps_completed_blocks() {
+    const TOTAL: usize = 3 * 1024 * 1024;
+    const BLOCK: usize = 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("bitmap-resume");
+    let dest = dir.join("r.bin");
+    let part = dest.with_file_name("r.bin.part");
+    let meta_path = dest.with_file_name("r.bin.part.meta");
+
+    // 预置正确的第 0 块内容 + 位图标记第 0 块完成。
+    std::fs::write(&part, &server.data[..BLOCK]).unwrap();
+    let meta = serde_json::json!({
+        "version": 1,
+        "url": server.url("file"),
+        "total": TOTAL,
+        "sha256": null,
+        "block_size": BLOCK,
+        "bitmap": [1u64],
+        "updated_at": 0
+    });
+    std::fs::write(&meta_path, meta.to_string()).unwrap();
+
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    assert!(!meta_path.exists(), "完成后必须清理 sidecar 元数据");
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #2：sidecar 身份不符（URL 不同）时必须连 .part 一起丢弃，不能复用。
+#[tokio::test]
+async fn stale_meta_is_discarded_with_part() {
+    const TOTAL: usize = 2 * 1024 * 1024;
+    const BLOCK: usize = 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("stale-meta");
+    let dest = dir.join("s.bin");
+    let part = dest.with_file_name("s.bin.part");
+    let meta_path = dest.with_file_name("s.bin.part.meta");
+
+    // 满大小但全 0 的 .part + 指向另一个 URL 的旧 meta。
+    std::fs::write(&part, vec![0u8; TOTAL]).unwrap();
+    let meta = serde_json::json!({
+        "version": 1,
+        "url": "https://example.invalid/other.jar",
+        "total": TOTAL,
+        "sha256": null,
+        "block_size": BLOCK,
+        "bitmap": [3u64],
+        "updated_at": 0
+    });
+    std::fs::write(&meta_path, meta.to_string()).unwrap();
+
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "身份不符的 meta 必须被丢弃，不能把预置内容当成已完成"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #5：全局段许可为 1 时，两个任务仍能依次推进并完成（不发生互锁）。
+#[tokio::test]
+async fn global_segment_limit_serializes_without_deadlock() {
+    const TOTAL: usize = 3 * 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("global-seg-limit");
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 512 * 1024;
+    opts.max_total_segments = 1;
+    let m = DownloadManager::new(opts, 2);
+    let d1 = dir.join("a.bin");
+    let d2 = dir.join("b.bin");
+    let id1 = m.add(DownloadTask::new(server.url("file"), d1.clone()));
+    let id2 = m.add(DownloadTask::new(server.url("file"), d2.clone()));
+
+    assert_eq!(
+        wait_state(&m, id1, TaskState::Completed, Duration::from_secs(60)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        wait_state(&m, id2, TaskState::Completed, Duration::from_secs(60)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&d1).unwrap(), *server.data);
+    assert_eq!(std::fs::read(&d2).unwrap(), *server.data);
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #10：全局限速（令牌桶）对所有段共享，聚合速率不得超过上限。
+#[tokio::test]
+async fn global_rate_limit_caps_aggregate_speed() {
+    const TOTAL: usize = 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("global-rate");
+    let dest = dir.join("r.bin");
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    opts.max_download_speed = Some(512 * 1024);
+    let m = DownloadManager::new(opts, 1);
+    let start = std::time::Instant::now();
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "512 KiB/s 下 1 MiB 不应在 {elapsed:?} 内完成"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

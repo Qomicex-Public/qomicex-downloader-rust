@@ -29,6 +29,10 @@ pub(crate) struct DownloadStats {
 
 /// 任务运行上下文（由 manager 构造）。
 pub(crate) struct RunContext {
+    /// 全局段许可（跨任务共享），限制聚合连接数（issue #5）。
+    pub segment_sem: Arc<tokio::sync::Semaphore>,
+    /// 全局限速（None = 不限速），跨任务共享。
+    pub limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
     pub task: crate::task::DownloadTask,
     pub cancel: CancellationToken,
     pub events: Sender<DownloadEvent>,
@@ -57,9 +61,9 @@ pub(crate) struct RunContext {
     pub use_h1: AtomicBool,
     /// 当前是否使用 HTTP/3 优先。开启后在首个连接类失败时原子翻转为 false 回退 HTTP/2。
     pub use_h3: AtomicBool,
-    /// 按宿主的探测结果缓存（host → 支持 Range？）。跨任务共享，避免同主机大量
-    /// 小文件逐文件 HEAD 探测。
-    pub host_probe: Arc<std::sync::RwLock<HashMap<String, bool>>>,
+    /// 按 (scheme, host, port) 缓存「是否支持 Range」，带 TTL 与连续失败计数。
+    /// 跨任务共享，避免同主机大量小文件逐文件 HEAD 探测。
+    pub host_probe: Arc<std::sync::RwLock<HashMap<String, RangeHealth>>>,
     /// 已知不可用/挂起的宿主（host → 发现时刻）。跨任务共享：一个源在某文件上
     /// 一个字节都没给出来，后续文件直接把它排到最后，不必每个文件都再等一轮
     /// 看门狗。TTL 到期自动恢复尝试，避免源只是短暂抖动就被永久拉黑。
@@ -76,6 +80,56 @@ pub(crate) struct RunContext {
 
 /// 死源拉黑时长。短于常见 CDN 抖动恢复时间，又足够让同一批大量小文件跳过它。
 pub(crate) const DEAD_HOST_TTL: Duration = Duration::from_secs(120);
+
+/// 单主机的 Range 支持判定。
+///
+/// 旧实现只按 host 缓存一个 bool，有两个坑（issue #8）：键不含 scheme/端口会串线；
+/// 单条路径异常（某种资源实际不支持 Range）会把整台主机永久判为不支持，后续大文件
+/// 被迫单连接流式。现在：
+/// - 键 = scheme://host:port；
+/// - 连续 RANGE_PROBE_MISSES 次「谎报 Range」才否定整台主机；
+/// - HOST_PROBE_TTL 后重新判定，避免临时故障长期生效。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RangeHealth {
+    pub ok: bool,
+    pub misses: u8,
+    pub checked_at: Instant,
+}
+
+pub(crate) const HOST_PROBE_TTL: Duration = Duration::from_secs(600);
+const RANGE_PROBE_MISSES: u8 = 2;
+
+/// 目标路径的规范化键：绝对路径；Windows 上再折叠大小写（同卷大小写不敏感，
+/// 两个仅大小写不同的 dest 会写同一个文件）。
+pub(crate) fn normalize_dest(dest: &Path) -> std::path::PathBuf {
+    let abs = std::path::absolute(dest).unwrap_or_else(|_| dest.to_path_buf());
+    #[cfg(windows)]
+    let abs = std::path::PathBuf::from(abs.to_string_lossy().to_lowercase());
+    abs
+}
+
+/// Range 判定的缓存键：scheme + host + port（默认端口按 scheme 补齐）。
+pub(crate) fn probe_key(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some(v) => v,
+        None => return url.to_string(),
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h, p.to_string())
+        }
+        _ => (
+            authority,
+            if scheme.eq_ignore_ascii_case("https") {
+                "443".to_string()
+            } else {
+                "80".to_string()
+            },
+        ),
+    };
+    format!("{scheme}://{host}:{port}")
+}
 
 impl RunContext {
     /// 拉黑宿主（本次任务在该源上一个字节都没拿到）。
@@ -104,6 +158,49 @@ impl RunContext {
             }
         }
         self.mark_host_dead(&host);
+    }
+
+    /// 该 URL 所在主机的 Range 判定（TTL 内有效）。
+    pub(crate) fn cached_range_ok(&self, url: &str) -> Option<bool> {
+        let key = probe_key(url);
+        let guard = self.host_probe.read().unwrap();
+        guard
+            .get(&key)
+            .filter(|h| h.checked_at.elapsed() < HOST_PROBE_TTL)
+            .map(|h| h.ok)
+    }
+
+    /// 记录一次「谎报 Range」（声称支持、实际回整包）。连续命中才否定整台主机。
+    pub(crate) fn record_range_miss(&self, url: &str) {
+        let key = probe_key(url);
+        let mut guard = self.host_probe.write().unwrap();
+        let e = guard.entry(key).or_insert(RangeHealth {
+            ok: true,
+            misses: 0,
+            checked_at: Instant::now(),
+        });
+        e.misses = e.misses.saturating_add(1);
+        e.checked_at = Instant::now();
+        if e.misses >= RANGE_PROBE_MISSES {
+            e.ok = false;
+        }
+    }
+
+    /// 记录一次正常判定。已被连续失败否定的主机不会被单次响应头翻回 true。
+    pub(crate) fn record_range_ok(&self, url: &str, ok: bool) {
+        let key = probe_key(url);
+        let mut guard = self.host_probe.write().unwrap();
+        if guard.get(&key).is_some_and(|h| !h.ok) {
+            return;
+        }
+        guard.insert(
+            key,
+            RangeHealth {
+                ok,
+                misses: 0,
+                checked_at: Instant::now(),
+            },
+        );
     }
 
     /// 记录本次连接的对端地址：确认该 IP 可用，解除其拉黑。
@@ -217,6 +314,8 @@ type SegmentOutcome = (u32, Result<(), SegFailure>);
 enum SegError {
     Cancelled,
     Retryable(String),
+    /// 非瞬态错误（4xx，除 408/429）：重试同一源没有意义，立即换镜像。
+    Fatal(String),
     /// 服务器对带 Range 的请求返回全文件 200：非瞬态故障，重试/换段均无意义，
     /// 立即放弃分片路径转整文件流式（实测 dpdns.org 镜像：HEAD 宣称
     /// Accept-Ranges: bytes，GET+Range 却回 200，旧逻辑每段空转 5 次重试）。
@@ -277,6 +376,8 @@ impl Engine {
         part: &Path,
         total: u64,
     ) -> Result<(), DownloadError> {
+        // 写盘前预检可用空间（issue #9）：不足时立即失败，避免下到一半才发现。
+        ensure_disk_space(part, total)?;
         let opts = &ctx.options;
         let mut segments: HashMap<u32, Segment> = build_segments(
             total,
@@ -288,34 +389,56 @@ impl Engine {
         .map(|s| (s.index, s))
         .collect();
 
-        if let Ok(meta) = tokio::fs::metadata(part).await {
-            let part_size = meta.len();
-            if part_size > total {
-                tokio::fs::remove_file(part).await?;
-                // .part 已删除、全部段从头下载：清空累计计数，否则进度会超 100%
-                ctx.stats.downloaded.store(0, Ordering::Relaxed);
-            } else if part_size > 0 {
-                for s in segments.values_mut() {
-                    s.align_to_part(part_size);
-                }
-                // 以各段对齐后的实际基准重置计数：上次尝试（暂停/中断/校验失败重下）
-                // 留下的累计值与本次 .part 不一致，会导致进度虚高或回跳。
-                let resumed: u64 = segments
-                    .values()
-                    .map(|s| s.downloaded.load(Ordering::Relaxed))
-                    .sum();
-                ctx.stats.downloaded.store(resumed, Ordering::Relaxed);
+        // 续传以块级完成位图为准（issue #2）：.part 的文件大小只是「最高水位」，
+        // 多段并行时中间空洞无法从大小推断。meta 缺失、身份不符（url / total /
+        // sha256 / 块大小）或 .part 超出总长时，一律丢弃两者从头下载。
+        let meta_path = crate::part_meta::meta_path_for(part);
+        let sha_hex = ctx.task.sha256.as_ref().map(|d| hex_encode(d));
+        let mut part_meta = match crate::part_meta::PartMeta::load(&meta_path).await {
+            Some(m)
+                if m.matches(
+                    &ctx.task.url,
+                    total,
+                    sha_hex.as_deref(),
+                    crate::part_meta::DEFAULT_BLOCK_SIZE,
+                ) =>
+            {
+                m
+            }
+            _ => {
+                let _ = tokio::fs::remove_file(part).await;
+                let _ = tokio::fs::remove_file(&meta_path).await;
+                crate::part_meta::PartMeta::new(
+                    &ctx.task.url,
+                    total,
+                    sha_hex,
+                    crate::part_meta::DEFAULT_BLOCK_SIZE,
+                )
+            }
+        };
+
+        if part.is_file() {
+            // 段起点可能不在块边界：resumable_bytes 保守返回 0（块内不完整就重下，
+            // 最多浪费 1 MiB/段），绝不跳过未确认的数据。
+            for s in segments.values_mut() {
+                let got = part_meta.resumable_bytes(s.start, s.len());
+                s.downloaded.store(got, Ordering::Relaxed);
+            }
+            let resumed: u64 = segments
+                .values()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .sum();
+            ctx.stats.downloaded.store(resumed, Ordering::Relaxed);
+            if resumed > 0 {
                 ctx.log(
                     LogLevel::Info,
-                    format!("断点续传: 已存在 .part {part_size} 字节"),
+                    format!("断点续传: 位图已确认 {resumed} 字节"),
                 );
-            } else {
-                ctx.stats.downloaded.store(0, Ordering::Relaxed);
             }
         } else {
-            // 全新下载（含 ChecksumMismatch 自动重下等 .part 已被清理的场景）
             ctx.stats.downloaded.store(0, Ordering::Relaxed);
         }
+        part_meta.save(&meta_path).await.ok();
         if let Some(parent) = part.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -330,6 +453,13 @@ impl Engine {
         let reporter = spawn_progress_reporter(ctx);
 
         let mut degraded = false;
+        // issue #6：拆分只有在确实提速时才继续。每次拆分记录当时速率，下一拍比较；
+        // 连续两拍看不出提升就停止拆分（连接数不是瓶颈时继续拆只增加开销与竞争）。
+        let mut split_enabled = true;
+        let mut split_baseline: Option<f64> = None;
+        let mut split_stalls: u32 = 0;
+        let mut smooth_speed = 0.0f64;
+        let mut last_sample = (Instant::now(), ctx.stats.downloaded.load(Ordering::Relaxed));
         loop {
             // 启动待运行段（受并发上限约束）
             if !degraded {
@@ -343,9 +473,17 @@ impl Engine {
                     if seg_handles.len() >= max_segments {
                         break;
                     }
+                    // 全局段许可：拿不到就本轮不启动，等下轮（段结束释放 permit）。
+                    let Ok(permit) = ctx.segment_sem.clone().try_acquire_owned() else {
+                        break;
+                    };
                     let idx = seg.index;
                     ctx.stats.active_segments.fetch_add(1, Ordering::Relaxed);
-                    let ah = set.spawn(run_segment(ctx.clone(), seg));
+                    let ctx_task = ctx.clone();
+                    let ah = set.spawn(async move {
+                        let _permit = permit;
+                        run_segment(ctx_task, seg).await
+                    });
                     seg_handles.insert(idx, ah);
                 }
             }
@@ -366,6 +504,9 @@ impl Engine {
                 _ = ctx.cancel.cancelled() => {
                     for h in seg_handles.values() { h.abort(); }
                     reporter.abort();
+                    // 保留已完成区块信息，恢复时只补空洞。
+                    refresh_bitmap(&mut part_meta, &segments);
+                    part_meta.save(&meta_path).await.ok();
                     return Err(DownloadError::Cancelled);
                 }
                 out = set.join_next() => {
@@ -374,7 +515,9 @@ impl Engine {
                             ctx.stats.active_segments.fetch_sub(1, Ordering::Relaxed);
                             seg_handles.remove(&idx);
                             match result {
-                                Ok(()) => { segments.remove(&idx); }
+                                // 完成段保留：位图重算需要所有段的水位（删掉会让已完成
+                                // 区块重新变回「未覆盖」）。
+                                Ok(()) => {}
                                 Err(SegFailure::Cancelled) => {}
                                 Err(SegFailure::Exhausted(reason)) => {
                                     ctx.log(LogLevel::Error, format!("段 {idx} 重试耗尽: {reason}"));
@@ -393,9 +536,47 @@ impl Engine {
                     }
                 }
                 _ = sleep(opts.split_sample_interval) => {
+                    // 周期性把位图落到 sidecar：崩溃最多重下最后一个采样窗口的数据。
+                    refresh_bitmap(&mut part_meta, &segments);
+                    part_meta.save(&meta_path).await.ok();
+
+                    let now_dl = ctx.stats.downloaded.load(Ordering::Relaxed);
+                    let elapsed = last_sample.0.elapsed().as_secs_f64();
+                    if elapsed > 0.0 {
+                        let inst = now_dl.saturating_sub(last_sample.1) as f64 / elapsed;
+                        smooth_speed = if smooth_speed == 0.0 {
+                            inst
+                        } else {
+                            smooth_speed * 0.7 + inst * 0.3
+                        };
+                    }
+                    last_sample = (Instant::now(), now_dl);
+
                     if degraded { continue; }
-                    if seg_handles.len() < max_segments {
+                    // 上一拍拆分后的效果评估。
+                    if let Some(base) = split_baseline.take() {
+                        if smooth_speed > base * 1.1 {
+                            split_stalls = 0;
+                        } else {
+                            split_stalls += 1;
+                            if split_stalls >= 2 && split_enabled {
+                                split_enabled = false;
+                                ctx.log(
+                                    LogLevel::Info,
+                                    "拆分连续无提速，停止继续拆分（issue #6）".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    if split_enabled
+                        && seg_handles.len() < max_segments
+                        && ctx.segment_sem.available_permits() > 0
+                    {
+                        let before = seg_handles.len();
                         try_split(ctx, &mut segments, &mut seg_handles, seg_counter.clone()).await;
+                        if seg_handles.len() > before {
+                            split_baseline = Some(smooth_speed.max(1.0));
+                        }
                     }
                 }
             }
@@ -406,14 +587,23 @@ impl Engine {
             return self.download_full_fallback(ctx, part, total).await;
         }
 
+        // 完成判定：所有块都确认写完，且文件长度等于总长（issue #2）。只比长度
+        // 无法发现中间空洞。
+        refresh_bitmap(&mut part_meta, &segments);
         let actual = tokio::fs::metadata(part).await?.len();
-        if actual != total {
+        if actual != total || !part_meta.all_complete() {
+            let done: u64 = segments
+                .values()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .sum();
             return Err(DownloadError::Incomplete {
                 expected: total,
-                actual,
+                actual: done.min(total),
             });
         }
+        part_meta.save(&meta_path).await.ok();
         finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await?;
+        let _ = tokio::fs::remove_file(&meta_path).await;
         Ok(())
     }
 
@@ -425,15 +615,16 @@ impl Engine {
         _total: u64,
     ) -> Result<(), DownloadError> {
         let _ = tokio::fs::remove_file(part).await;
+        let _ = tokio::fs::remove_file(crate::part_meta::meta_path_for(part)).await;
         self.run_streamed(ctx, part).await
     }
 
     // ---------------- 流式路径（服务器不支持 Range） ----------------
 
     async fn run_streamed(&self, ctx: &Arc<RunContext>, part: &Path) -> Result<(), DownloadError> {
-        if part.exists() {
-            tokio::fs::remove_file(part).await?;
-        }
+        // 注意：这里**不再**删除已有的 .part。run_once 现在总是先走一次流式请求做
+        // 响应头嗅探（判断是否该转分片），若在入口就删文件，分片路径的断点续传会在
+        // 决策之前被清空。真正的清理由重试循环内每次尝试前的 `remove_file` 负责。
         if let Some(parent) = part.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -452,7 +643,9 @@ impl Engine {
                 }
                 // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）；
                 // 计数同步归零——.part 从头下，累计值不清会让进度超 100%
-                let _ = tokio::fs::remove_file(part).await;
+                // 每次尝试前清空 .part 的工作交给 `try_streamed_once`——必须放在
+                // 响应头嗅探**之后**，否则 run_once 的流式嗅探会在决定走分片之前
+                // 把断点续传的 .part 删掉（会让多段续传彻底失效）。
                 ctx.stats.downloaded.store(0, Ordering::Relaxed);
                 match try_streamed_once(ctx, part, &url).await {
                     Ok(()) => {
@@ -467,6 +660,24 @@ impl Engine {
                         // 旧实现要耗尽 max_retries × idle 才轮换：默认 5×30s，实测单文件
                         // 约 5 分钟才用上可用镜像。
                         let got_bytes = ctx.stats.downloaded.load(Ordering::Relaxed) > 0;
+                        // 4xx（除 408/429）：重试同一源没有意义，直接换镜像。
+                        let fatal_status = match &e {
+                            DownloadError::HttpStatus { status, .. } => {
+                                !is_retryable_status(*status)
+                            }
+                            _ => false,
+                        };
+                        if fatal_status && ctx.has_other_url() {
+                            if let Some(next) = ctx.mirror_url() {
+                                attempt = 0;
+                                url = next;
+                                ctx.log(
+                                    LogLevel::Warn,
+                                    format!("非瞬态错误（{e}），立即切换镜像 {url}"),
+                                );
+                                continue;
+                            }
+                        }
                         if !got_bytes {
                             ctx.mark_source_dead(&url);
                         }
@@ -529,6 +740,19 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
         match try_segment_once(&ctx, &mut seg, &attempt_url).await {
             Ok(()) => return (idx, Ok(())),
             Err(SegError::Cancelled) => return (idx, Err(SegFailure::Cancelled)),
+            Err(SegError::Fatal(reason)) => {
+                // 4xx（非 408/429）：该源这条路径不存在/无权限，重试同一源只是空转。
+                if let Some(next) = ctx.mirror_url() {
+                    attempt = 0;
+                    attempt_url = next;
+                    ctx.log(
+                        LogLevel::Warn,
+                        format!("段 {idx}: 非瞬态错误（{reason}），立即切换镜像 {attempt_url}"),
+                    );
+                    continue;
+                }
+                return (idx, Err(SegFailure::Exhausted(reason)));
+            }
             Err(SegError::RangeIgnored) => {
                 // ponytail: 不轮换镜像重试分片——镜像对 Range 的支持未知，直接整文件流式最稳
                 ctx.log(
@@ -623,15 +847,48 @@ async fn try_segment_once(
             seg.start == 0 && seg.end + 1 == total && seg.downloaded.load(Ordering::Relaxed) == 0;
         if !whole_file_single {
             // 探测缓存翻转为不支持 Range：同主机后续文件直接走流式，不再撞同一堵墙
-            ctx.host_probe.write().unwrap().insert(host_of(url), false);
+            ctx.record_range_miss(url);
             return Err(SegError::RangeIgnored);
         }
     }
     if !status.is_success() {
-        return Err(SegError::Retryable(format!("HTTP {status} ({url})")));
+        let code = status.as_u16();
+        if code == 429 {
+            // 429：按 Retry-After 停一下再重试，避免持续触发风控（上限 30s）。
+            if let Some(secs) = retry_after_secs(resp.headers()) {
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(SegError::Cancelled),
+                    _ = sleep(Duration::from_secs(secs.min(30))) => {}
+                }
+            }
+        }
+        let msg = format!("HTTP {status} ({url})");
+        if is_retryable_status(code) {
+            return Err(SegError::Retryable(msg));
+        }
+        return Err(SegError::Fatal(msg));
     }
     // 连接已建立：记录对端 IP，确认该节点可用（IP 级黑名单据此解除）。
     ctx.note_remote(url, resp.remote_addr());
+
+    // 分段响应必须与请求区间一致（issue #3）：异常 CDN 或中间层可能回整包/超长
+    // body，越过 seg.end 就会覆盖相邻段。206 必须带合法 Content-Range 且落在本次
+    // 请求区间内；总长与已知值不一致同样视为该源不可信。
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let total_known = ctx.stats.total.load(Ordering::Relaxed);
+        match parse_content_range(resp.headers()) {
+            Some((start, end, total)) => {
+                let bad_total = matches!(total, Some(t) if total_known > 0 && t != total_known);
+                if start != from || end > seg.end || bad_total {
+                    return Err(SegError::Retryable(format!(
+                        "Content-Range 与请求不符: 收到 {start}-{end}/{total:?}，请求 {from}-{}/{}",
+                        seg.end, total_known
+                    )));
+                }
+            }
+            None => return Err(SegError::Retryable("206 响应缺少合法 Content-Range".into())),
+        }
+    }
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -661,10 +918,26 @@ async fn try_segment_once(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
-                        file.write_all(&bytes).await
+                        // 绝不越过段尾写：多出来的字节属于相邻段，写进去就是静默损坏。
+                        let remaining =
+                            seg.len().saturating_sub(seg.downloaded.load(Ordering::Relaxed));
+                        if remaining == 0 {
+                            return Err(SegError::Retryable("响应体超出段范围".into()));
+                        }
+                        let take = (bytes.len() as u64).min(remaining) as usize;
+                        file.write_all(&bytes[..take]).await
                             .map_err(|e| SegError::Retryable(e.to_string()))?;
-                        seg.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        ctx.stats.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        seg.downloaded.fetch_add(take as u64, Ordering::Relaxed);
+                        ctx.stats.downloaded.fetch_add(take as u64, Ordering::Relaxed);
+                        if let Some(l) = &ctx.limiter {
+                            l.acquire(take as u64).await;
+                        }
+                        if take < bytes.len() {
+                            return Err(SegError::Retryable(format!(
+                                "响应体超出段范围: 段剩余 {remaining} 字节，收到 {} 字节",
+                                bytes.len()
+                            )));
+                        }
                         last_activity = Instant::now();
                     }
                     Some(Err(e)) => {
@@ -739,8 +1012,17 @@ async fn try_streamed_once(
     let status = resp.status();
     ctx.log(LogLevel::Debug, format!("流式响应: {status}"));
     if !status.is_success() {
+        let code = status.as_u16();
+        if code == 429 {
+            if let Some(secs) = retry_after_secs(resp.headers()) {
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(DownloadError::Cancelled),
+                    _ = sleep(Duration::from_secs(secs.min(30))) => {}
+                }
+            }
+        }
         return Err(DownloadError::HttpStatus {
-            status: status.as_u16(),
+            status: code,
             url: url.to_string(),
         });
     }
@@ -751,16 +1033,12 @@ async fn try_streamed_once(
     //      分段必须用落地地址，见 `resolved_url` 字段注释）；
     //   2. 缓存该宿主是否支持 Range，供后续同主机文件复用判定。
     ctx.set_resolved_url(resp.url().as_str());
-    let host = host_of(url);
-    let cached_range = ctx.host_probe.read().unwrap().get(&host).copied();
+    let cached_range = ctx.cached_range_ok(url);
     let header_range_ok = accept_ranges_bytes(resp.headers());
     // 只在没有既有结论时写入：`try_segment_once` 发现「谎报 Range」会把缓存翻成
     // false，若这里再按响应头写回 true，同主机每个文件都会重新撞一次分片。
     if cached_range.is_none() {
-        ctx.host_probe
-            .write()
-            .unwrap()
-            .insert(host.clone(), header_range_ok);
+        ctx.record_range_ok(url, header_range_ok);
     }
     let range_ok = cached_range.unwrap_or(header_range_ok);
     let total = content_length(resp.headers());
@@ -784,10 +1062,14 @@ async fn try_streamed_once(
         return Err(DownloadError::NeedsRanged(total.unwrap_or(0)));
     }
 
+    // 流式重试/首次真正开始写之前清空 .part（嗅探阶段已提前返回，不会走到这里）。
+    // 块位图随之失效，一并删除，避免下次误用。
+    let _ = tokio::fs::remove_file(part).await;
+    let _ = tokio::fs::remove_file(crate::part_meta::meta_path_for(part)).await;
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(false) // 循环内每次尝试前删除文件，避免残留叠加
+        .truncate(false) // 上一次尝试的残留已在上方删除
         .open(part)
         .await?;
     let mut stream = resp.bytes_stream();
@@ -801,6 +1083,9 @@ async fn try_streamed_once(
                     Some(Ok(bytes)) => {
                         file.write_all(&bytes).await?;
                         ctx.stats.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        if let Some(l) = &ctx.limiter {
+                            l.acquire(bytes.len() as u64).await;
+                        }
                         last_activity = Instant::now();
                     }
                     Some(Err(e)) => return Err(DownloadError::Http(e)),
@@ -839,6 +1124,46 @@ async fn try_streamed_once(
     }
 }
 
+/// 依据各段「已写入水位」重算完成位图。
+///
+/// 段之间互不重叠（拆分只会沿边界切分），因此「块内各段覆盖长度之和 == 块长」
+/// 就等价于该块已完整写入；这个判定是幂等的，重试/拆分都不会重复计数。
+fn refresh_bitmap(meta: &mut crate::part_meta::PartMeta, segments: &HashMap<u32, Segment>) {
+    for block in 0..meta.used_blocks() {
+        let (b0, b1) = meta.block_range(block);
+        let covered: u64 = segments
+            .values()
+            .map(|s| {
+                let ws = s.start;
+                let we = (s.start + s.downloaded.load(Ordering::Relaxed)).min(s.end + 1);
+                if we <= b0 || ws >= b1 {
+                    0
+                } else {
+                    we.min(b1) - ws.max(b0)
+                }
+            })
+            .sum();
+        meta.set_complete(block, covered == b1 - b0);
+    }
+}
+/// 目标盘空间预检（issue #9）。
+///
+/// 峰值占用 = 尚未 rename 的 `.part`（total）+ 最终文件（total），按 1.1 倍留余量。
+/// 预检是尽力而为：拿不到可用空间（路径不存在等）时不阻断下载。
+fn ensure_disk_space(part: &Path, total: u64) -> Result<(), DownloadError> {
+    let dir = part.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(available) = fs2::available_space(dir) else {
+        return Ok(());
+    };
+    let required = total.saturating_add(total / 10);
+    if available < required {
+        return Err(DownloadError::InsufficientSpace {
+            required,
+            available,
+        });
+    }
+    Ok(())
+}
 // ================= 动态拆分 =================
 
 /// 动态拆分：周期性检查，把剩余字节最多的活跃段一分为二（并行度提升）。
@@ -938,6 +1263,38 @@ fn content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .ok()
 }
 
+/// 该状态码是否值得在同一源上重试。
+///
+/// 4xx 里只有 408（请求超时）与 429（限流）属于瞬态；其余是路径不存在/无权限，
+/// 重试同一源只会空转（issue #7）。5xx 与网络错误按瞬态处理，走指数退避。
+fn is_retryable_status(code: u16) -> bool {
+    !(400..500).contains(&code) || code == 408 || code == 429
+}
+
+/// 解析 Retry-After（仅支持秒数形式；HTTP-date 形式忽略）。
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// 解析 `Content-Range: bytes start-end/total`（total 允许为 `*`）。
+fn parse_content_range(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64, Option<u64>)> {
+    let v = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let rest = v.trim().strip_prefix("bytes")?.trim();
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((
+        start.trim().parse().ok()?,
+        end.trim().parse().ok()?,
+        total.trim().parse().ok(),
+    ))
+}
+
 fn accept_ranges_bytes(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get(reqwest::header::ACCEPT_RANGES)
@@ -1013,4 +1370,98 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ensure_disk_space, is_retryable_status, normalize_dest, parse_content_range, probe_key,
+        retry_after_secs,
+    };
+    use crate::DownloadError;
+    use std::path::Path;
+
+    #[test]
+    fn probe_key_includes_scheme_and_port() {
+        assert_eq!(probe_key("https://a.example/x"), "https://a.example:443");
+        assert_eq!(
+            probe_key("http://a.example:8080/x"),
+            "http://a.example:8080"
+        );
+        // 同 host 不同 scheme/端口不再共用缓存（issue #8）
+        assert_ne!(
+            probe_key("https://a.example/x"),
+            probe_key("http://a.example/x")
+        );
+    }
+
+    #[test]
+    fn parse_content_range_reads_start_end_total() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            "bytes 100-199/1000".parse().unwrap(),
+        );
+        assert_eq!(parse_content_range(&h), Some((100, 199, Some(1000))));
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            "bytes 0-9/*".parse().unwrap(),
+        );
+        assert_eq!(parse_content_range(&h), Some((0, 9, None)));
+        h.remove(reqwest::header::CONTENT_RANGE);
+        assert_eq!(parse_content_range(&h), None);
+    }
+
+    #[test]
+    fn retryable_status_fast_fails_on_4xx_except_408_429() {
+        // issue #7：路径不存在/无权限重试同一源没有意义
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(403));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(410));
+        assert!(is_retryable_status(408));
+        assert!(is_retryable_status(429));
+        // 5xx 与 3xx 仍按瞬态处理
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_only() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&h), None);
+        h.insert(reqwest::header::RETRY_AFTER, "12".parse().unwrap());
+        assert_eq!(retry_after_secs(&h), Some(12));
+        // HTTP-date 形式不解析（返回 None，调用方按默认退避处理）
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after_secs(&h), None);
+    }
+
+    #[test]
+    fn disk_precheck_rejects_impossible_size() {
+        let part = std::env::temp_dir().join("qml-space-check.part");
+        match ensure_disk_space(&part, u64::MAX) {
+            Err(DownloadError::InsufficientSpace {
+                required,
+                available,
+            }) => {
+                assert!(required > 0);
+                assert!(available < required);
+            }
+            other => panic!("应提前判定空间不足，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_dest_folds_case_on_windows() {
+        let a = normalize_dest(Path::new("C:/Games/MC/A.jar"));
+        let b = normalize_dest(Path::new("C:/Games/MC/a.jar"));
+        #[cfg(windows)]
+        assert_eq!(a, b, "Windows 上仅大小写不同的目标必须视为同一路径");
+        #[cfg(not(windows))]
+        assert_ne!(a, b);
+    }
 }

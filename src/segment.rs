@@ -36,13 +36,6 @@ impl Segment {
         self.downloaded.load(Ordering::Relaxed) >= self.len()
     }
 
-    /// 断点续传对齐：按 `.part` 现有大小估算各段已下载字节。
-    /// 基于写盘区间不重叠、重复写入幂等的假设，误差由后续请求覆盖修正。
-    pub fn align_to_part(&mut self, part_size: u64) {
-        let v = part_size.saturating_sub(self.start).min(self.len());
-        self.downloaded.store(v, Ordering::Relaxed);
-    }
-
     /// 动态拆分：沿中间切成两段。A 段继承已下载字节（截断到 A 长度），
     /// B 段从新起点重新下载（重复写区间幂等，安全）。
     /// 两段各自持全新计数器（不共享父计数器）：父任务 abort 竞态下的残余
@@ -137,24 +130,13 @@ mod tests {
     }
 
     #[test]
-    fn align_clamps() {
-        let mut s = Segment::new(0, 100, 199);
-        s.align_to_part(150);
-        assert_eq!(s.downloaded.load(Ordering::Relaxed), 50);
-        s.align_to_part(1000);
-        assert_eq!(s.downloaded.load(Ordering::Relaxed), 100);
-        s.align_to_part(0);
-        assert_eq!(s.downloaded.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
     fn shared_counter_visible_across_clones() {
         // 回归防护核心语义：clone 出去的任务副本与原对象共享同一计数。
-        let mut original = Segment::new(0, 0, 999);
+        let original = Segment::new(0, 0, 999);
         let task_copy = original.clone();
         task_copy.downloaded.fetch_add(123, Ordering::Relaxed);
         assert_eq!(original.downloaded.load(Ordering::Relaxed), 123);
-        original.align_to_part(50); // store 走同一 Arc
+        original.downloaded.store(50, Ordering::Relaxed); // store 走同一 Arc
         assert_eq!(task_copy.downloaded.load(Ordering::Relaxed), 50);
     }
 }
