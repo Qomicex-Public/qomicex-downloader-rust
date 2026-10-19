@@ -381,49 +381,56 @@ impl Engine {
         .map(|s| (s.index, s))
         .collect();
 
-        if let Ok(meta) = tokio::fs::metadata(part).await {
-            let part_size = meta.len();
-            if part_size > total {
-                tokio::fs::remove_file(part).await?;
-                // .part 已删除、全部段从头下载：清空累计计数，否则进度会超 100%
-                ctx.stats.downloaded.store(0, Ordering::Relaxed);
-            } else if part_size > 0 && segments.len() > 1 {
-                // issue #2：多段并行时 .part 的大小只是「最高水位」，中间空洞无法从
-                // 文件大小推断。旧实现按大小回填各段 downloaded，水位以下的段被判为
-                // 完成、缺口永不补齐，而最终校验只比较文件长度——缺口在中间且末段写满
-                // 时会静默产出损坏文件。
-                //
-                // 在块级位图（sidecar meta）落地前，多段续传一律丢弃重下：宁可多花流量，
-                // 也不产出内容错误的文件。单段（≤ split_threshold）写入从 0 顺序推进，
-                // 文件大小即连续前缀，仍可安全续传。
-                tokio::fs::remove_file(part).await?;
-                ctx.stats.downloaded.store(0, Ordering::Relaxed);
-                ctx.log(
-                    LogLevel::Warn,
-                    "多段下载缺少块级校验信息，丢弃 .part 从头下载（issue #2）".to_string(),
-                );
-            } else if part_size > 0 {
-                for s in segments.values_mut() {
-                    s.align_to_part(part_size);
-                }
-                // 以各段对齐后的实际基准重置计数：上次尝试（暂停/中断/校验失败重下）
-                // 留下的累计值与本次 .part 不一致，会导致进度虚高或回跳。
-                let resumed: u64 = segments
-                    .values()
-                    .map(|s| s.downloaded.load(Ordering::Relaxed))
-                    .sum();
-                ctx.stats.downloaded.store(resumed, Ordering::Relaxed);
+        // 续传以块级完成位图为准（issue #2）：.part 的文件大小只是「最高水位」，
+        // 多段并行时中间空洞无法从大小推断。meta 缺失、身份不符（url / total /
+        // sha256 / 块大小）或 .part 超出总长时，一律丢弃两者从头下载。
+        let meta_path = crate::part_meta::meta_path_for(part);
+        let sha_hex = ctx.task.sha256.as_ref().map(|d| hex_encode(d));
+        let mut part_meta = match crate::part_meta::PartMeta::load(&meta_path).await {
+            Some(m)
+                if m.matches(
+                    &ctx.task.url,
+                    total,
+                    sha_hex.as_deref(),
+                    crate::part_meta::DEFAULT_BLOCK_SIZE,
+                ) =>
+            {
+                m
+            }
+            _ => {
+                let _ = tokio::fs::remove_file(part).await;
+                let _ = tokio::fs::remove_file(&meta_path).await;
+                crate::part_meta::PartMeta::new(
+                    &ctx.task.url,
+                    total,
+                    sha_hex,
+                    crate::part_meta::DEFAULT_BLOCK_SIZE,
+                )
+            }
+        };
+
+        if part.is_file() {
+            // 段起点可能不在块边界：resumable_bytes 保守返回 0（块内不完整就重下，
+            // 最多浪费 1 MiB/段），绝不跳过未确认的数据。
+            for s in segments.values_mut() {
+                let got = part_meta.resumable_bytes(s.start, s.len());
+                s.downloaded.store(got, Ordering::Relaxed);
+            }
+            let resumed: u64 = segments
+                .values()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .sum();
+            ctx.stats.downloaded.store(resumed, Ordering::Relaxed);
+            if resumed > 0 {
                 ctx.log(
                     LogLevel::Info,
-                    format!("断点续传: 已存在 .part {part_size} 字节"),
+                    format!("断点续传: 位图已确认 {resumed} 字节"),
                 );
-            } else {
-                ctx.stats.downloaded.store(0, Ordering::Relaxed);
             }
         } else {
-            // 全新下载（含 ChecksumMismatch 自动重下等 .part 已被清理的场景）
             ctx.stats.downloaded.store(0, Ordering::Relaxed);
         }
+        part_meta.save(&meta_path).await.ok();
         if let Some(parent) = part.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -474,6 +481,9 @@ impl Engine {
                 _ = ctx.cancel.cancelled() => {
                     for h in seg_handles.values() { h.abort(); }
                     reporter.abort();
+                    // 保留已完成区块信息，恢复时只补空洞。
+                    refresh_bitmap(&mut part_meta, &segments);
+                    part_meta.save(&meta_path).await.ok();
                     return Err(DownloadError::Cancelled);
                 }
                 out = set.join_next() => {
@@ -482,7 +492,9 @@ impl Engine {
                             ctx.stats.active_segments.fetch_sub(1, Ordering::Relaxed);
                             seg_handles.remove(&idx);
                             match result {
-                                Ok(()) => { segments.remove(&idx); }
+                                // 完成段保留：位图重算需要所有段的水位（删掉会让已完成
+                                // 区块重新变回「未覆盖」）。
+                                Ok(()) => {}
                                 Err(SegFailure::Cancelled) => {}
                                 Err(SegFailure::Exhausted(reason)) => {
                                     ctx.log(LogLevel::Error, format!("段 {idx} 重试耗尽: {reason}"));
@@ -501,6 +513,9 @@ impl Engine {
                     }
                 }
                 _ = sleep(opts.split_sample_interval) => {
+                    // 周期性把位图落到 sidecar：崩溃最多重下最后一个采样窗口的数据。
+                    refresh_bitmap(&mut part_meta, &segments);
+                    part_meta.save(&meta_path).await.ok();
                     if degraded { continue; }
                     if seg_handles.len() < max_segments {
                         try_split(ctx, &mut segments, &mut seg_handles, seg_counter.clone()).await;
@@ -514,14 +529,23 @@ impl Engine {
             return self.download_full_fallback(ctx, part, total).await;
         }
 
+        // 完成判定：所有块都确认写完，且文件长度等于总长（issue #2）。只比长度
+        // 无法发现中间空洞。
+        refresh_bitmap(&mut part_meta, &segments);
         let actual = tokio::fs::metadata(part).await?.len();
-        if actual != total {
+        if actual != total || !part_meta.all_complete() {
+            let done: u64 = segments
+                .values()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .sum();
             return Err(DownloadError::Incomplete {
                 expected: total,
-                actual,
+                actual: done.min(total),
             });
         }
+        part_meta.save(&meta_path).await.ok();
         finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await?;
+        let _ = tokio::fs::remove_file(&meta_path).await;
         Ok(())
     }
 
@@ -533,6 +557,7 @@ impl Engine {
         _total: u64,
     ) -> Result<(), DownloadError> {
         let _ = tokio::fs::remove_file(part).await;
+        let _ = tokio::fs::remove_file(crate::part_meta::meta_path_for(part)).await;
         self.run_streamed(ctx, part).await
     }
 
@@ -923,7 +948,9 @@ async fn try_streamed_once(
     }
 
     // 流式重试/首次真正开始写之前清空 .part（嗅探阶段已提前返回，不会走到这里）。
+    // 块位图随之失效，一并删除，避免下次误用。
     let _ = tokio::fs::remove_file(part).await;
+    let _ = tokio::fs::remove_file(crate::part_meta::meta_path_for(part)).await;
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -979,6 +1006,28 @@ async fn try_streamed_once(
     }
 }
 
+/// 依据各段「已写入水位」重算完成位图。
+///
+/// 段之间互不重叠（拆分只会沿边界切分），因此「块内各段覆盖长度之和 == 块长」
+/// 就等价于该块已完整写入；这个判定是幂等的，重试/拆分都不会重复计数。
+fn refresh_bitmap(meta: &mut crate::part_meta::PartMeta, segments: &HashMap<u32, Segment>) {
+    for block in 0..meta.used_blocks() {
+        let (b0, b1) = meta.block_range(block);
+        let covered: u64 = segments
+            .values()
+            .map(|s| {
+                let ws = s.start;
+                let we = (s.start + s.downloaded.load(Ordering::Relaxed)).min(s.end + 1);
+                if we <= b0 || ws >= b1 {
+                    0
+                } else {
+                    we.min(b1) - ws.max(b0)
+                }
+            })
+            .sum();
+        meta.set_complete(block, covered == b1 - b0);
+    }
+}
 // ================= 动态拆分 =================
 
 /// 动态拆分：周期性检查，把剩余字节最多的活跃段一分为二（并行度提升）。

@@ -78,6 +78,7 @@ pub mod task;
 
 pub mod dns;
 mod engine;
+mod part_meta;
 mod segment;
 
 pub use error::DownloadError;

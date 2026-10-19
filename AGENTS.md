@@ -31,7 +31,7 @@ RUSTFLAGS="--cfg reqwest_unstable" cargo clippy --all-targets --features http3
 
 ## 依赖（2026-08-19 更新）
 
-- 主依赖：tokio / reqwest(rustls, http2) / futures-util / thiserror / rand / tokio-util / **sha2**（SHA-256 校验）
+- 主依赖：tokio / reqwest(rustls, http2) / futures-util / thiserror / rand / tokio-util / **sha2**（SHA-256 校验）/ **serde**（derive，用于 .part.meta 位图）
 - Cargo features：`default=[]`；`http3` 可选（挂载 `reqwest/http3`，引入 quinn/h3 QUIC 栈，需 `--cfg reqwest_unstable`，仅供非 Android 场景按需开启）
-- dev 依赖：sha2（测试计算校验和）
+- dev 依赖：sha2（测试计算校验和）、serde_json（构造 sidecar 元数据）
 - 依赖变更须同步更新本清单与 Cargo.toml

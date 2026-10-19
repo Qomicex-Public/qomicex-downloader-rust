@@ -1179,3 +1179,85 @@ async fn multisegment_resume_with_holes_is_discarded() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// issue #2 正式方案：带块级位图时，已完成块不再重下，且完成判定以位图为准。
+#[tokio::test]
+async fn bitmap_resume_keeps_completed_blocks() {
+    const TOTAL: usize = 3 * 1024 * 1024;
+    const BLOCK: usize = 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("bitmap-resume");
+    let dest = dir.join("r.bin");
+    let part = dest.with_file_name("r.bin.part");
+    let meta_path = dest.with_file_name("r.bin.part.meta");
+
+    // 预置正确的第 0 块内容 + 位图标记第 0 块完成。
+    std::fs::write(&part, &server.data[..BLOCK]).unwrap();
+    let meta = serde_json::json!({
+        "version": 1,
+        "url": server.url("file"),
+        "total": TOTAL,
+        "sha256": null,
+        "block_size": BLOCK,
+        "bitmap": [1u64],
+        "updated_at": 0
+    });
+    std::fs::write(&meta_path, meta.to_string()).unwrap();
+
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    assert!(!meta_path.exists(), "完成后必须清理 sidecar 元数据");
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #2：sidecar 身份不符（URL 不同）时必须连 .part 一起丢弃，不能复用。
+#[tokio::test]
+async fn stale_meta_is_discarded_with_part() {
+    const TOTAL: usize = 2 * 1024 * 1024;
+    const BLOCK: usize = 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("stale-meta");
+    let dest = dir.join("s.bin");
+    let part = dest.with_file_name("s.bin.part");
+    let meta_path = dest.with_file_name("s.bin.part.meta");
+
+    // 满大小但全 0 的 .part + 指向另一个 URL 的旧 meta。
+    std::fs::write(&part, vec![0u8; TOTAL]).unwrap();
+    let meta = serde_json::json!({
+        "version": 1,
+        "url": "https://example.invalid/other.jar",
+        "total": TOTAL,
+        "sha256": null,
+        "block_size": BLOCK,
+        "bitmap": [3u64],
+        "updated_at": 0
+    });
+    std::fs::write(&meta_path, meta.to_string()).unwrap();
+
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "身份不符的 meta 必须被丢弃，不能把预置内容当成已完成"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
