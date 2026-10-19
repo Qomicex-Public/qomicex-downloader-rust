@@ -80,6 +80,9 @@ pub struct DownloadOptions {
     pub segment_size: u64,
     /// 任务内最大并发段数（动态拆分的上限）。
     pub max_segments: u32,
+    /// 全局并行段上限（所有任务合计）。任务并发数 × 段数即连接数；无全局上限时
+    /// 批量下载会线性增长，打满文件句柄并触发服务端限流（issue #5）。
+    pub max_total_segments: u32,
     /// 超过该大小才分片；小文件单请求直传。
     pub split_threshold: u64,
     /// 看门狗：段内无任何数据到达超过该时长 → 重建段。
@@ -142,6 +145,7 @@ impl Default for DownloadOptions {
             retry_base_delay: Duration::from_millis(500),
             segment_size: 8 * 1024 * 1024,
             max_segments: 16,
+            max_total_segments: 64,
             split_threshold: 10 * 1024 * 1024,
             watchdog_idle_timeout: Duration::from_secs(30),
             watchdog_slow_factor: 0.3,

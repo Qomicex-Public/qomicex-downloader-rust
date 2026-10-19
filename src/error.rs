@@ -32,6 +32,10 @@ pub enum DownloadError {
     #[error("下载数据不完整: 期望 {expected} 字节, 实际 {actual} 字节")]
     Incomplete { expected: u64, actual: u64 },
 
+    /// 目标盘剩余空间不足（issue #9）。峰值占用约为 total 的两倍（.part + 最终文件）。
+    #[error("磁盘空间不足: 需要 {required} 字节, 可用 {available} 字节")]
+    InsufficientSpace { required: u64, available: u64 },
+
     /// 服务器返回空响应体（0 字节）。
     ///
     /// 几乎总是上游异常而非合法文件：镜像节点挂掉/重定向到坏节点时会回

@@ -1261,3 +1261,33 @@ async fn stale_meta_is_discarded_with_part() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// issue #5：全局段许可为 1 时，两个任务仍能依次推进并完成（不发生互锁）。
+#[tokio::test]
+async fn global_segment_limit_serializes_without_deadlock() {
+    const TOTAL: usize = 3 * 1024 * 1024;
+    let server = MockServer::start(TOTAL, Behavior::default()).await;
+    let dir = tmp_dir("global-seg-limit");
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 512 * 1024;
+    opts.max_total_segments = 1;
+    let m = DownloadManager::new(opts, 2);
+    let d1 = dir.join("a.bin");
+    let d2 = dir.join("b.bin");
+    let id1 = m.add(DownloadTask::new(server.url("file"), d1.clone()));
+    let id2 = m.add(DownloadTask::new(server.url("file"), d2.clone()));
+
+    assert_eq!(
+        wait_state(&m, id1, TaskState::Completed, Duration::from_secs(60)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        wait_state(&m, id2, TaskState::Completed, Duration::from_secs(60)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&d1).unwrap(), *server.data);
+    assert_eq!(std::fs::read(&d2).unwrap(), *server.data);
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

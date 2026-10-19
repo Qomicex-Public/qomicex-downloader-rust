@@ -29,6 +29,8 @@ pub(crate) struct DownloadStats {
 
 /// 任务运行上下文（由 manager 构造）。
 pub(crate) struct RunContext {
+    /// 全局段许可（跨任务共享），限制聚合连接数（issue #5）。
+    pub segment_sem: Arc<tokio::sync::Semaphore>,
     pub task: crate::task::DownloadTask,
     pub cancel: CancellationToken,
     pub events: Sender<DownloadEvent>,
@@ -372,6 +374,8 @@ impl Engine {
         part: &Path,
         total: u64,
     ) -> Result<(), DownloadError> {
+        // 写盘前预检可用空间（issue #9）：不足时立即失败，避免下到一半才发现。
+        ensure_disk_space(part, total)?;
         let opts = &ctx.options;
         let mut segments: HashMap<u32, Segment> = build_segments(
             total,
@@ -467,9 +471,17 @@ impl Engine {
                     if seg_handles.len() >= max_segments {
                         break;
                     }
+                    // 全局段许可：拿不到就本轮不启动，等下轮（段结束释放 permit）。
+                    let Ok(permit) = ctx.segment_sem.clone().try_acquire_owned() else {
+                        break;
+                    };
                     let idx = seg.index;
                     ctx.stats.active_segments.fetch_add(1, Ordering::Relaxed);
-                    let ah = set.spawn(run_segment(ctx.clone(), seg));
+                    let ctx_task = ctx.clone();
+                    let ah = set.spawn(async move {
+                        let _permit = permit;
+                        run_segment(ctx_task, seg).await
+                    });
                     seg_handles.insert(idx, ah);
                 }
             }
@@ -554,7 +566,10 @@ impl Engine {
                             }
                         }
                     }
-                    if split_enabled && seg_handles.len() < max_segments {
+                    if split_enabled
+                        && seg_handles.len() < max_segments
+                        && ctx.segment_sem.available_permits() > 0
+                    {
                         let before = seg_handles.len();
                         try_split(ctx, &mut segments, &mut seg_handles, seg_counter.clone()).await;
                         if seg_handles.len() > before {
@@ -1123,6 +1138,24 @@ fn refresh_bitmap(meta: &mut crate::part_meta::PartMeta, segments: &HashMap<u32,
         meta.set_complete(block, covered == b1 - b0);
     }
 }
+/// 目标盘空间预检（issue #9）。
+///
+/// 峰值占用 = 尚未 rename 的 `.part`（total）+ 最终文件（total），按 1.1 倍留余量。
+/// 预检是尽力而为：拿不到可用空间（路径不存在等）时不阻断下载。
+fn ensure_disk_space(part: &Path, total: u64) -> Result<(), DownloadError> {
+    let dir = part.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(available) = fs2::available_space(dir) else {
+        return Ok(());
+    };
+    let required = total.saturating_add(total / 10);
+    if available < required {
+        return Err(DownloadError::InsufficientSpace {
+            required,
+            available,
+        });
+    }
+    Ok(())
+}
 // ================= 动态拆分 =================
 
 /// 动态拆分：周期性检查，把剩余字节最多的活跃段一分为二（并行度提升）。
@@ -1334,8 +1367,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_retryable_status, normalize_dest, parse_content_range, probe_key, retry_after_secs,
+        ensure_disk_space, is_retryable_status, normalize_dest, parse_content_range, probe_key,
+        retry_after_secs,
     };
+    use crate::DownloadError;
     use std::path::Path;
 
     #[test]
@@ -1395,6 +1430,21 @@ mod tests {
             "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
         );
         assert_eq!(retry_after_secs(&h), None);
+    }
+
+    #[test]
+    fn disk_precheck_rejects_impossible_size() {
+        let part = std::env::temp_dir().join("qml-space-check.part");
+        match ensure_disk_space(&part, u64::MAX) {
+            Err(DownloadError::InsufficientSpace {
+                required,
+                available,
+            }) => {
+                assert!(required > 0);
+                assert!(available < required);
+            }
+            other => panic!("应提前判定空间不足，实际: {other:?}"),
+        }
     }
 
     #[test]
