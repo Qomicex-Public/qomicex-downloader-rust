@@ -1076,3 +1076,106 @@ async fn dead_source_without_bytes_switches_immediately() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ================= issue #2/#3/#4 回归 =================
+
+/// issue #3：服务器 206 谎报 Content-Range 起点时，绝不能把响应体写进相邻段。
+/// 分段路径应判定为源不可信 → 降级整文件流式，最终内容仍需逐字节一致。
+#[tokio::test]
+async fn bad_content_range_never_corrupts_neighbor_segments() {
+    let server = MockServer::start(
+        2 * 1024 * 1024,
+        Behavior {
+            bad_content_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("bad-cr");
+    let dest = dir.join("b.bin");
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed,
+        "应降级整文件完成"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "Content-Range 与请求不符时不得写越界（issue #3）"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #4：两个任务指向同一 dest 时，第二个必须明确失败，而不是并发写同一个 .part。
+#[tokio::test]
+async fn same_dest_concurrent_task_is_rejected() {
+    let server = MockServer::start(
+        1024 * 1024,
+        Behavior {
+            throttle: Some((256 * 1024, 256 * 1024)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("dest-lock");
+    let dest = dir.join("same.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let id1 = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    // 等第一个任务真正进入下载（占用 dest）后再加第二个。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let id2 = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id2, TaskState::Failed, Duration::from_secs(10)).await,
+        TaskState::Failed,
+        "同 dest 的第二个任务必须明确失败"
+    );
+    assert_eq!(
+        wait_state(&m, id1, TaskState::Completed, Duration::from_secs(60)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "文件内容不得被交错写入"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #2：多段续传时 .part 大小只是最高水位，不能据此推断各段已下载量。
+/// 预置一个「满大小但内容错误」的 .part，修复后必须丢弃重下；修复前会把
+/// 零字节内容当成下载完成（长度一致即通过校验）。
+#[tokio::test]
+async fn multisegment_resume_with_holes_is_discarded() {
+    let server = MockServer::start(2 * 1024 * 1024, Behavior::default()).await;
+    let dir = tmp_dir("hole-resume");
+    let dest = dir.join("h.bin");
+    let part = dest.with_file_name("h.bin.part");
+    std::fs::write(&part, vec![0u8; 2 * 1024 * 1024]).unwrap();
+
+    let mut opts = fast_opts();
+    opts.split_threshold = 1024;
+    opts.segment_size = 256 * 1024;
+    let m = DownloadManager::new(opts, 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(40)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *server.data,
+        "带洞 .part 不得被当成已完成（issue #2）"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -44,6 +44,9 @@ pub struct Behavior {
     pub throttle: Option<(u64, u64)>,
     /// `/status404` 恒返回 404。
     pub status404: bool,
+    /// 206 响应的 `Content-Range` 始终从 0 开始（与请求区间不符），
+    /// 模拟异常 CDN / 中间层篡改响应头。用于验证段写入不会越界污染相邻段。
+    pub bad_content_range: bool,
 }
 
 pub struct MockServer {
@@ -350,8 +353,10 @@ async fn handle_conn(
             "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         return write_response(&mut stream, header.as_bytes(), &[], None).await;
     }
+    // bad_content_range：谎报起点，模拟篡改响应头的中间层。
+    let claimed_a = if behavior.bad_content_range { 0 } else { a };
     let header = format!(
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {claimed_a}-{b}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
         b - a + 1
     );
     body_parts.push((data[a as usize..=b as usize].to_vec(), None));

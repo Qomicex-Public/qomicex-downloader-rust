@@ -57,9 +57,9 @@ pub(crate) struct RunContext {
     pub use_h1: AtomicBool,
     /// 当前是否使用 HTTP/3 优先。开启后在首个连接类失败时原子翻转为 false 回退 HTTP/2。
     pub use_h3: AtomicBool,
-    /// 按宿主的探测结果缓存（host → 支持 Range？）。跨任务共享，避免同主机大量
-    /// 小文件逐文件 HEAD 探测。
-    pub host_probe: Arc<std::sync::RwLock<HashMap<String, bool>>>,
+    /// 按 (scheme, host, port) 缓存「是否支持 Range」，带 TTL 与连续失败计数。
+    /// 跨任务共享，避免同主机大量小文件逐文件 HEAD 探测。
+    pub host_probe: Arc<std::sync::RwLock<HashMap<String, RangeHealth>>>,
     /// 已知不可用/挂起的宿主（host → 发现时刻）。跨任务共享：一个源在某文件上
     /// 一个字节都没给出来，后续文件直接把它排到最后，不必每个文件都再等一轮
     /// 看门狗。TTL 到期自动恢复尝试，避免源只是短暂抖动就被永久拉黑。
@@ -76,6 +76,56 @@ pub(crate) struct RunContext {
 
 /// 死源拉黑时长。短于常见 CDN 抖动恢复时间，又足够让同一批大量小文件跳过它。
 pub(crate) const DEAD_HOST_TTL: Duration = Duration::from_secs(120);
+
+/// 单主机的 Range 支持判定。
+///
+/// 旧实现只按 host 缓存一个 bool，有两个坑（issue #8）：键不含 scheme/端口会串线；
+/// 单条路径异常（某种资源实际不支持 Range）会把整台主机永久判为不支持，后续大文件
+/// 被迫单连接流式。现在：
+/// - 键 = scheme://host:port；
+/// - 连续 RANGE_PROBE_MISSES 次「谎报 Range」才否定整台主机；
+/// - HOST_PROBE_TTL 后重新判定，避免临时故障长期生效。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RangeHealth {
+    pub ok: bool,
+    pub misses: u8,
+    pub checked_at: Instant,
+}
+
+pub(crate) const HOST_PROBE_TTL: Duration = Duration::from_secs(600);
+const RANGE_PROBE_MISSES: u8 = 2;
+
+/// 目标路径的规范化键：绝对路径；Windows 上再折叠大小写（同卷大小写不敏感，
+/// 两个仅大小写不同的 dest 会写同一个文件）。
+pub(crate) fn normalize_dest(dest: &Path) -> std::path::PathBuf {
+    let abs = std::path::absolute(dest).unwrap_or_else(|_| dest.to_path_buf());
+    #[cfg(windows)]
+    let abs = std::path::PathBuf::from(abs.to_string_lossy().to_lowercase());
+    abs
+}
+
+/// Range 判定的缓存键：scheme + host + port（默认端口按 scheme 补齐）。
+pub(crate) fn probe_key(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some(v) => v,
+        None => return url.to_string(),
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h, p.to_string())
+        }
+        _ => (
+            authority,
+            if scheme.eq_ignore_ascii_case("https") {
+                "443".to_string()
+            } else {
+                "80".to_string()
+            },
+        ),
+    };
+    format!("{scheme}://{host}:{port}")
+}
 
 impl RunContext {
     /// 拉黑宿主（本次任务在该源上一个字节都没拿到）。
@@ -104,6 +154,49 @@ impl RunContext {
             }
         }
         self.mark_host_dead(&host);
+    }
+
+    /// 该 URL 所在主机的 Range 判定（TTL 内有效）。
+    pub(crate) fn cached_range_ok(&self, url: &str) -> Option<bool> {
+        let key = probe_key(url);
+        let guard = self.host_probe.read().unwrap();
+        guard
+            .get(&key)
+            .filter(|h| h.checked_at.elapsed() < HOST_PROBE_TTL)
+            .map(|h| h.ok)
+    }
+
+    /// 记录一次「谎报 Range」（声称支持、实际回整包）。连续命中才否定整台主机。
+    pub(crate) fn record_range_miss(&self, url: &str) {
+        let key = probe_key(url);
+        let mut guard = self.host_probe.write().unwrap();
+        let e = guard.entry(key).or_insert(RangeHealth {
+            ok: true,
+            misses: 0,
+            checked_at: Instant::now(),
+        });
+        e.misses = e.misses.saturating_add(1);
+        e.checked_at = Instant::now();
+        if e.misses >= RANGE_PROBE_MISSES {
+            e.ok = false;
+        }
+    }
+
+    /// 记录一次正常判定。已被连续失败否定的主机不会被单次响应头翻回 true。
+    pub(crate) fn record_range_ok(&self, url: &str, ok: bool) {
+        let key = probe_key(url);
+        let mut guard = self.host_probe.write().unwrap();
+        if guard.get(&key).is_some_and(|h| !h.ok) {
+            return;
+        }
+        guard.insert(
+            key,
+            RangeHealth {
+                ok,
+                misses: 0,
+                checked_at: Instant::now(),
+            },
+        );
     }
 
     /// 记录本次连接的对端地址：确认该 IP 可用，解除其拉黑。
@@ -294,6 +387,21 @@ impl Engine {
                 tokio::fs::remove_file(part).await?;
                 // .part 已删除、全部段从头下载：清空累计计数，否则进度会超 100%
                 ctx.stats.downloaded.store(0, Ordering::Relaxed);
+            } else if part_size > 0 && segments.len() > 1 {
+                // issue #2：多段并行时 .part 的大小只是「最高水位」，中间空洞无法从
+                // 文件大小推断。旧实现按大小回填各段 downloaded，水位以下的段被判为
+                // 完成、缺口永不补齐，而最终校验只比较文件长度——缺口在中间且末段写满
+                // 时会静默产出损坏文件。
+                //
+                // 在块级位图（sidecar meta）落地前，多段续传一律丢弃重下：宁可多花流量，
+                // 也不产出内容错误的文件。单段（≤ split_threshold）写入从 0 顺序推进，
+                // 文件大小即连续前缀，仍可安全续传。
+                tokio::fs::remove_file(part).await?;
+                ctx.stats.downloaded.store(0, Ordering::Relaxed);
+                ctx.log(
+                    LogLevel::Warn,
+                    "多段下载缺少块级校验信息，丢弃 .part 从头下载（issue #2）".to_string(),
+                );
             } else if part_size > 0 {
                 for s in segments.values_mut() {
                     s.align_to_part(part_size);
@@ -431,9 +539,9 @@ impl Engine {
     // ---------------- 流式路径（服务器不支持 Range） ----------------
 
     async fn run_streamed(&self, ctx: &Arc<RunContext>, part: &Path) -> Result<(), DownloadError> {
-        if part.exists() {
-            tokio::fs::remove_file(part).await?;
-        }
+        // 注意：这里**不再**删除已有的 .part。run_once 现在总是先走一次流式请求做
+        // 响应头嗅探（判断是否该转分片），若在入口就删文件，分片路径的断点续传会在
+        // 决策之前被清空。真正的清理由重试循环内每次尝试前的 `remove_file` 负责。
         if let Some(parent) = part.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -452,7 +560,9 @@ impl Engine {
                 }
                 // 每次尝试前清空 .part（流式无断点续传，防止残留叠加）；
                 // 计数同步归零——.part 从头下，累计值不清会让进度超 100%
-                let _ = tokio::fs::remove_file(part).await;
+                // 每次尝试前清空 .part 的工作交给 `try_streamed_once`——必须放在
+                // 响应头嗅探**之后**，否则 run_once 的流式嗅探会在决定走分片之前
+                // 把断点续传的 .part 删掉（会让多段续传彻底失效）。
                 ctx.stats.downloaded.store(0, Ordering::Relaxed);
                 match try_streamed_once(ctx, part, &url).await {
                     Ok(()) => {
@@ -623,7 +733,7 @@ async fn try_segment_once(
             seg.start == 0 && seg.end + 1 == total && seg.downloaded.load(Ordering::Relaxed) == 0;
         if !whole_file_single {
             // 探测缓存翻转为不支持 Range：同主机后续文件直接走流式，不再撞同一堵墙
-            ctx.host_probe.write().unwrap().insert(host_of(url), false);
+            ctx.record_range_miss(url);
             return Err(SegError::RangeIgnored);
         }
     }
@@ -632,6 +742,25 @@ async fn try_segment_once(
     }
     // 连接已建立：记录对端 IP，确认该节点可用（IP 级黑名单据此解除）。
     ctx.note_remote(url, resp.remote_addr());
+
+    // 分段响应必须与请求区间一致（issue #3）：异常 CDN 或中间层可能回整包/超长
+    // body，越过 seg.end 就会覆盖相邻段。206 必须带合法 Content-Range 且落在本次
+    // 请求区间内；总长与已知值不一致同样视为该源不可信。
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let total_known = ctx.stats.total.load(Ordering::Relaxed);
+        match parse_content_range(resp.headers()) {
+            Some((start, end, total)) => {
+                let bad_total = matches!(total, Some(t) if total_known > 0 && t != total_known);
+                if start != from || end > seg.end || bad_total {
+                    return Err(SegError::Retryable(format!(
+                        "Content-Range 与请求不符: 收到 {start}-{end}/{total:?}，请求 {from}-{}/{}",
+                        seg.end, total_known
+                    )));
+                }
+            }
+            None => return Err(SegError::Retryable("206 响应缺少合法 Content-Range".into())),
+        }
+    }
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -661,10 +790,23 @@ async fn try_segment_once(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
-                        file.write_all(&bytes).await
+                        // 绝不越过段尾写：多出来的字节属于相邻段，写进去就是静默损坏。
+                        let remaining =
+                            seg.len().saturating_sub(seg.downloaded.load(Ordering::Relaxed));
+                        if remaining == 0 {
+                            return Err(SegError::Retryable("响应体超出段范围".into()));
+                        }
+                        let take = (bytes.len() as u64).min(remaining) as usize;
+                        file.write_all(&bytes[..take]).await
                             .map_err(|e| SegError::Retryable(e.to_string()))?;
-                        seg.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        ctx.stats.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        seg.downloaded.fetch_add(take as u64, Ordering::Relaxed);
+                        ctx.stats.downloaded.fetch_add(take as u64, Ordering::Relaxed);
+                        if take < bytes.len() {
+                            return Err(SegError::Retryable(format!(
+                                "响应体超出段范围: 段剩余 {remaining} 字节，收到 {} 字节",
+                                bytes.len()
+                            )));
+                        }
                         last_activity = Instant::now();
                     }
                     Some(Err(e)) => {
@@ -751,16 +893,12 @@ async fn try_streamed_once(
     //      分段必须用落地地址，见 `resolved_url` 字段注释）；
     //   2. 缓存该宿主是否支持 Range，供后续同主机文件复用判定。
     ctx.set_resolved_url(resp.url().as_str());
-    let host = host_of(url);
-    let cached_range = ctx.host_probe.read().unwrap().get(&host).copied();
+    let cached_range = ctx.cached_range_ok(url);
     let header_range_ok = accept_ranges_bytes(resp.headers());
     // 只在没有既有结论时写入：`try_segment_once` 发现「谎报 Range」会把缓存翻成
     // false，若这里再按响应头写回 true，同主机每个文件都会重新撞一次分片。
     if cached_range.is_none() {
-        ctx.host_probe
-            .write()
-            .unwrap()
-            .insert(host.clone(), header_range_ok);
+        ctx.record_range_ok(url, header_range_ok);
     }
     let range_ok = cached_range.unwrap_or(header_range_ok);
     let total = content_length(resp.headers());
@@ -784,10 +922,12 @@ async fn try_streamed_once(
         return Err(DownloadError::NeedsRanged(total.unwrap_or(0)));
     }
 
+    // 流式重试/首次真正开始写之前清空 .part（嗅探阶段已提前返回，不会走到这里）。
+    let _ = tokio::fs::remove_file(part).await;
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(false) // 循环内每次尝试前删除文件，避免残留叠加
+        .truncate(false) // 上一次尝试的残留已在上方删除
         .open(part)
         .await?;
     let mut stream = resp.bytes_stream();
@@ -938,6 +1078,19 @@ fn content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .ok()
 }
 
+/// 解析 `Content-Range: bytes start-end/total`（total 允许为 `*`）。
+fn parse_content_range(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64, Option<u64>)> {
+    let v = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let rest = v.trim().strip_prefix("bytes")?.trim();
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((
+        start.trim().parse().ok()?,
+        end.trim().parse().ok()?,
+        total.trim().parse().ok(),
+    ))
+}
+
 fn accept_ranges_bytes(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get(reqwest::header::ACCEPT_RANGES)
@@ -1013,4 +1166,51 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_dest, parse_content_range, probe_key};
+    use std::path::Path;
+
+    #[test]
+    fn probe_key_includes_scheme_and_port() {
+        assert_eq!(probe_key("https://a.example/x"), "https://a.example:443");
+        assert_eq!(
+            probe_key("http://a.example:8080/x"),
+            "http://a.example:8080"
+        );
+        // 同 host 不同 scheme/端口不再共用缓存（issue #8）
+        assert_ne!(
+            probe_key("https://a.example/x"),
+            probe_key("http://a.example/x")
+        );
+    }
+
+    #[test]
+    fn parse_content_range_reads_start_end_total() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            "bytes 100-199/1000".parse().unwrap(),
+        );
+        assert_eq!(parse_content_range(&h), Some((100, 199, Some(1000))));
+        h.insert(
+            reqwest::header::CONTENT_RANGE,
+            "bytes 0-9/*".parse().unwrap(),
+        );
+        assert_eq!(parse_content_range(&h), Some((0, 9, None)));
+        h.remove(reqwest::header::CONTENT_RANGE);
+        assert_eq!(parse_content_range(&h), None);
+    }
+
+    #[test]
+    fn normalize_dest_folds_case_on_windows() {
+        let a = normalize_dest(Path::new("C:/Games/MC/A.jar"));
+        let b = normalize_dest(Path::new("C:/Games/MC/a.jar"));
+        #[cfg(windows)]
+        assert_eq!(a, b, "Windows 上仅大小写不同的目标必须视为同一路径");
+        #[cfg(not(windows))]
+        assert_ne!(a, b);
+    }
 }

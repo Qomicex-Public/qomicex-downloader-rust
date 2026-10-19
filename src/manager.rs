@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Qomicex Launcher Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -58,12 +58,15 @@ struct Inner {
     dispatch: Arc<Notify>,
     /// 按宿主的探测结果缓存（host → 支持 Range？）。同一 CDN 主机的大量小文件
     /// 只探测一次，后续任务直接下载，避免每个文件一次 HEAD（Java 启动器同款行为）。
-    host_probe: Arc<StdRwLock<HashMap<String, bool>>>,
+    host_probe: Arc<StdRwLock<HashMap<String, crate::engine::RangeHealth>>>,
     /// 已知在拉黑期内的宿主（host → 发现时刻）。任务启动时把它们的镜像排到最后，
     /// 避免同一批文件里每个都去撞同一个挂掉的源。
     host_dead: Arc<StdMutex<HashMap<String, Instant>>>,
     /// IP 级健康表 + 自定义解析器；代理生效时为 None（对端是代理，归因失真）。
     ip_health: Option<Arc<IpHealth>>,
+    /// 正在写入的目标路径（规范化后）。同一 dest 的并发任务会互相覆盖同一个
+    /// `.part`（issue #4），这里做进程内互斥：占用失败的任务直接失败，不交错写。
+    dest_locks: Arc<StdMutex<HashSet<std::path::PathBuf>>>,
     /// 全局进度聚合任务。
     aggregator: StdMutex<Option<JoinHandle<()>>>,
     /// 队列派发任务。
@@ -98,6 +101,7 @@ impl DownloadManager {
             host_probe: Arc::new(StdRwLock::new(HashMap::new())),
             host_dead: Arc::new(StdMutex::new(HashMap::new())),
             ip_health,
+            dest_locks: Arc::new(StdMutex::new(HashSet::new())),
             aggregator: StdMutex::new(None),
             dispatcher: StdMutex::new(None),
         });
@@ -483,9 +487,58 @@ async fn dispatch_loop(inner: Arc<Inner>) {
     }
 }
 
+/// 目标路径占用守卫：Drop 时释放，覆盖成功/失败/取消/panic 所有出口。
+struct DestGuard {
+    set: Arc<StdMutex<HashSet<std::path::PathBuf>>>,
+    key: std::path::PathBuf,
+}
+
+impl DestGuard {
+    fn acquire(
+        set: Arc<StdMutex<HashSet<std::path::PathBuf>>>,
+        key: std::path::PathBuf,
+    ) -> Option<Self> {
+        {
+            let mut guard = set.lock().unwrap();
+            if !guard.insert(key.clone()) {
+                return None;
+            }
+        }
+        Some(Self { set, key })
+    }
+}
+
+impl Drop for DestGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.key);
+    }
+}
 /// 单任务 worker：状态机 + engine 执行 + 收尾 + 唤醒派发。
 async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::OwnedSemaphorePermit) {
     let id = entry.task.id;
+
+    // 同一 dest 只允许一个任务写入：两个任务并行写同一个 .part 会交错覆盖字节，
+    // 产出内容不可信的文件（issue #4）。占用失败即失败，不排队等待——排队会让
+    // 上层批次误以为任务在正常推进。
+    let dest_key = crate::engine::normalize_dest(&entry.task.dest);
+    let Some(_dest_guard) = DestGuard::acquire(inner.dest_locks.clone(), dest_key) else {
+        {
+            let mut st = entry.state.write().unwrap();
+            *st = TaskState::Failed;
+        }
+        let _ = inner.events.send(DownloadEvent::StateChanged {
+            id,
+            state: TaskState::Failed,
+            detail: Some(format!(
+                "目标文件正在被另一个下载任务写入: {}",
+                entry.task.dest.display()
+            )),
+        });
+        drop(permit);
+        inner.dispatch.notify_one();
+        return;
+    };
+
     {
         let mut st = entry.state.write().unwrap();
         *st = TaskState::Downloading;
@@ -561,8 +614,8 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
     // 任务失败：清掉该主机的探测缓存，下次重试仍会重新探测（避免缓存盖住临时故障）；
     // 成功则保留缓存，同主机的后续大量小文件直接下载、不再逐文件探测。
     if result.is_err() {
-        let host = crate::engine::host_of(&entry.task.url);
-        inner.host_probe.write().unwrap().remove(&host);
+        let key = crate::engine::probe_key(&entry.task.url);
+        inner.host_probe.write().unwrap().remove(&key);
     }
     let (final_state, detail) = {
         let mut st = entry.state.write().unwrap();
