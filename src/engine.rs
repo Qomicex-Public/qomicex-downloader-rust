@@ -310,6 +310,8 @@ type SegmentOutcome = (u32, Result<(), SegFailure>);
 enum SegError {
     Cancelled,
     Retryable(String),
+    /// 非瞬态错误（4xx，除 408/429）：重试同一源没有意义，立即换镜像。
+    Fatal(String),
     /// 服务器对带 Range 的请求返回全文件 200：非瞬态故障，重试/换段均无意义，
     /// 立即放弃分片路径转整文件流式（实测 dpdns.org 镜像：HEAD 宣称
     /// Accept-Ranges: bytes，GET+Range 却回 200，旧逻辑每段空转 5 次重试）。
@@ -445,6 +447,13 @@ impl Engine {
         let reporter = spawn_progress_reporter(ctx);
 
         let mut degraded = false;
+        // issue #6：拆分只有在确实提速时才继续。每次拆分记录当时速率，下一拍比较；
+        // 连续两拍看不出提升就停止拆分（连接数不是瓶颈时继续拆只增加开销与竞争）。
+        let mut split_enabled = true;
+        let mut split_baseline: Option<f64> = None;
+        let mut split_stalls: u32 = 0;
+        let mut smooth_speed = 0.0f64;
+        let mut last_sample = (Instant::now(), ctx.stats.downloaded.load(Ordering::Relaxed));
         loop {
             // 启动待运行段（受并发上限约束）
             if !degraded {
@@ -516,9 +525,41 @@ impl Engine {
                     // 周期性把位图落到 sidecar：崩溃最多重下最后一个采样窗口的数据。
                     refresh_bitmap(&mut part_meta, &segments);
                     part_meta.save(&meta_path).await.ok();
+
+                    let now_dl = ctx.stats.downloaded.load(Ordering::Relaxed);
+                    let elapsed = last_sample.0.elapsed().as_secs_f64();
+                    if elapsed > 0.0 {
+                        let inst = now_dl.saturating_sub(last_sample.1) as f64 / elapsed;
+                        smooth_speed = if smooth_speed == 0.0 {
+                            inst
+                        } else {
+                            smooth_speed * 0.7 + inst * 0.3
+                        };
+                    }
+                    last_sample = (Instant::now(), now_dl);
+
                     if degraded { continue; }
-                    if seg_handles.len() < max_segments {
+                    // 上一拍拆分后的效果评估。
+                    if let Some(base) = split_baseline.take() {
+                        if smooth_speed > base * 1.1 {
+                            split_stalls = 0;
+                        } else {
+                            split_stalls += 1;
+                            if split_stalls >= 2 && split_enabled {
+                                split_enabled = false;
+                                ctx.log(
+                                    LogLevel::Info,
+                                    "拆分连续无提速，停止继续拆分（issue #6）".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    if split_enabled && seg_handles.len() < max_segments {
+                        let before = seg_handles.len();
                         try_split(ctx, &mut segments, &mut seg_handles, seg_counter.clone()).await;
+                        if seg_handles.len() > before {
+                            split_baseline = Some(smooth_speed.max(1.0));
+                        }
                     }
                 }
             }
@@ -602,6 +643,24 @@ impl Engine {
                         // 旧实现要耗尽 max_retries × idle 才轮换：默认 5×30s，实测单文件
                         // 约 5 分钟才用上可用镜像。
                         let got_bytes = ctx.stats.downloaded.load(Ordering::Relaxed) > 0;
+                        // 4xx（除 408/429）：重试同一源没有意义，直接换镜像。
+                        let fatal_status = match &e {
+                            DownloadError::HttpStatus { status, .. } => {
+                                !is_retryable_status(*status)
+                            }
+                            _ => false,
+                        };
+                        if fatal_status && ctx.has_other_url() {
+                            if let Some(next) = ctx.mirror_url() {
+                                attempt = 0;
+                                url = next;
+                                ctx.log(
+                                    LogLevel::Warn,
+                                    format!("非瞬态错误（{e}），立即切换镜像 {url}"),
+                                );
+                                continue;
+                            }
+                        }
                         if !got_bytes {
                             ctx.mark_source_dead(&url);
                         }
@@ -664,6 +723,19 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
         match try_segment_once(&ctx, &mut seg, &attempt_url).await {
             Ok(()) => return (idx, Ok(())),
             Err(SegError::Cancelled) => return (idx, Err(SegFailure::Cancelled)),
+            Err(SegError::Fatal(reason)) => {
+                // 4xx（非 408/429）：该源这条路径不存在/无权限，重试同一源只是空转。
+                if let Some(next) = ctx.mirror_url() {
+                    attempt = 0;
+                    attempt_url = next;
+                    ctx.log(
+                        LogLevel::Warn,
+                        format!("段 {idx}: 非瞬态错误（{reason}），立即切换镜像 {attempt_url}"),
+                    );
+                    continue;
+                }
+                return (idx, Err(SegFailure::Exhausted(reason)));
+            }
             Err(SegError::RangeIgnored) => {
                 // ponytail: 不轮换镜像重试分片——镜像对 Range 的支持未知，直接整文件流式最稳
                 ctx.log(
@@ -763,7 +835,21 @@ async fn try_segment_once(
         }
     }
     if !status.is_success() {
-        return Err(SegError::Retryable(format!("HTTP {status} ({url})")));
+        let code = status.as_u16();
+        if code == 429 {
+            // 429：按 Retry-After 停一下再重试，避免持续触发风控（上限 30s）。
+            if let Some(secs) = retry_after_secs(resp.headers()) {
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(SegError::Cancelled),
+                    _ = sleep(Duration::from_secs(secs.min(30))) => {}
+                }
+            }
+        }
+        let msg = format!("HTTP {status} ({url})");
+        if is_retryable_status(code) {
+            return Err(SegError::Retryable(msg));
+        }
+        return Err(SegError::Fatal(msg));
     }
     // 连接已建立：记录对端 IP，确认该节点可用（IP 级黑名单据此解除）。
     ctx.note_remote(url, resp.remote_addr());
@@ -906,8 +992,17 @@ async fn try_streamed_once(
     let status = resp.status();
     ctx.log(LogLevel::Debug, format!("流式响应: {status}"));
     if !status.is_success() {
+        let code = status.as_u16();
+        if code == 429 {
+            if let Some(secs) = retry_after_secs(resp.headers()) {
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return Err(DownloadError::Cancelled),
+                    _ = sleep(Duration::from_secs(secs.min(30))) => {}
+                }
+            }
+        }
         return Err(DownloadError::HttpStatus {
-            status: status.as_u16(),
+            status: code,
             url: url.to_string(),
         });
     }
@@ -1127,6 +1222,25 @@ fn content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .ok()
 }
 
+/// 该状态码是否值得在同一源上重试。
+///
+/// 4xx 里只有 408（请求超时）与 429（限流）属于瞬态；其余是路径不存在/无权限，
+/// 重试同一源只会空转（issue #7）。5xx 与网络错误按瞬态处理，走指数退避。
+fn is_retryable_status(code: u16) -> bool {
+    !(400..500).contains(&code) || code == 408 || code == 429
+}
+
+/// 解析 Retry-After（仅支持秒数形式；HTTP-date 形式忽略）。
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// 解析 `Content-Range: bytes start-end/total`（total 允许为 `*`）。
 fn parse_content_range(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64, Option<u64>)> {
     let v = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
@@ -1219,7 +1333,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_dest, parse_content_range, probe_key};
+    use super::{
+        is_retryable_status, normalize_dest, parse_content_range, probe_key, retry_after_secs,
+    };
     use std::path::Path;
 
     #[test]
@@ -1251,6 +1367,34 @@ mod tests {
         assert_eq!(parse_content_range(&h), Some((0, 9, None)));
         h.remove(reqwest::header::CONTENT_RANGE);
         assert_eq!(parse_content_range(&h), None);
+    }
+
+    #[test]
+    fn retryable_status_fast_fails_on_4xx_except_408_429() {
+        // issue #7：路径不存在/无权限重试同一源没有意义
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(403));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(410));
+        assert!(is_retryable_status(408));
+        assert!(is_retryable_status(429));
+        // 5xx 与 3xx 仍按瞬态处理
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_only() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&h), None);
+        h.insert(reqwest::header::RETRY_AFTER, "12".parse().unwrap());
+        assert_eq!(retry_after_secs(&h), Some(12));
+        // HTTP-date 形式不解析（返回 None，调用方按默认退避处理）
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after_secs(&h), None);
     }
 
     #[test]
