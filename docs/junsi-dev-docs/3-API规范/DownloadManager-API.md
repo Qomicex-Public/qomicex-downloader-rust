@@ -119,7 +119,19 @@ DownloadTask::new(url, dest)
     .with_segment_size(n)
     .with_sha256([u8; 32])         // SHA-256 校验和（原始字节）
     .with_sha256_hex("64位hex")    // SHA-256 校验和（hex，无效忽略）
+    .with_sha1([u8; 20])           // SHA-1 校验和（原始字节）
+    .with_sha1_hex("40位hex")      // SHA-1 校验和（hex，无效忽略）
+    .with_expected_size(n)         // 期望字节数（无摘要时用于截断检测）
 ```
+
+### 2026-10-21 更新：落盘内容校验
+
+`finalize` 依次按 **SHA-256 → SHA-1 → 期望大小** 校验（摘要优先：大小不符必然摘要也不符）。
+三者都未提供时不校验。校验不符返回 `ChecksumMismatch`，`Engine` 删除 `.part` 与 `.part.meta`
+后**换到下一个镜像**重下一次（无镜像时同源重下一次）；内容不符多是源给了坏字节，
+同源重试通常拿回同样的字节。
+
+`expected_size` 只有在没有摘要时才生效；调用方有摘要时应同时提供摘要，避免仅靠大小判定。
 
 ## `DownloadManager` API
 

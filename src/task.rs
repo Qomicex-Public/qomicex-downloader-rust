@@ -264,6 +264,12 @@ impl DownloadTask {
         self
     }
 
+    /// 设置 SHA-1 校验和（40 位十六进制字符串，无效则忽略）。
+    pub fn with_sha1_hex(mut self, hex: &str) -> Self {
+        self.sha1 = parse_hex_sha1(hex);
+        self
+    }
+
     /// 设置本地复用搜索目录（issue #11）。
     pub fn with_reuse_dirs(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
         self.reuse_dirs = dirs.into_iter().collect();
@@ -294,6 +300,21 @@ pub(crate) fn parse_hex_sha256(hex: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
+/// 解析 40 字符十六进制 SHA-1（无效返回 None）。
+pub(crate) fn parse_hex_sha1(hex: &str) -> Option<[u8; 20]> {
+    let hex = hex.trim();
+    if hex.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
         let hi = (chunk[0] as char).to_digit(16)?;
         let lo = (chunk[1] as char).to_digit(16)?;

@@ -45,8 +45,8 @@ pub enum DownloadError {
     #[error("服务器返回空响应体（0 字节，url: {url}）")]
     EmptyBody { url: String },
 
-    /// SHA-256 校验失败（自动重下一次后仍失败）。
-    #[error("SHA-256 校验失败: 期望 {expected}, 实际 {actual}")]
+    /// 内容校验失败（SHA-256 / SHA-1 / 期望大小不符；自动重下一次后仍失败）。
+    #[error("内容校验失败: 期望 {expected}, 实际 {actual}")]
     ChecksumMismatch { expected: String, actual: String },
 
     /// 所有重试/镜像均已耗尽。
