@@ -737,10 +737,83 @@ async fn sha256_mismatch_fails_after_redownload() {
     let events = drain_events(&mut rx);
     assert!(
         events.iter().any(
-            |e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("SHA-256"))
+            |e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("内容校验失败"))
         ),
-        "应产生 SHA-256 重下日志"
+        "应产生内容校验失败后的重下日志"
     );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sha1_verifies_content() {
+    use sha1::{Digest, Sha1};
+    let server = MockServer::start(512 * 1024, Behavior::default()).await;
+    let digest: [u8; 20] = Sha1::digest(&server.data[..]).into();
+    let dir = tmp_dir("sha1-ok");
+    let dest = dir.join("s1.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()).with_sha1(digest));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(20)).await,
+        TaskState::Completed
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), *server.data);
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 主源给了字节但内容不符（镜像 200 + 错误 body 的真实形态）时，必须换到下一个源重下，
+/// 而不是在同一源上把重试预算烧完。修复前 SHA-1 不参与校验，坏字节会被静默落盘。
+#[tokio::test]
+async fn sha1_mismatch_switches_to_mirror() {
+    use sha1::{Digest, Sha1};
+    let bad = MockServer::start(256 * 1024, Behavior::default()).await;
+    let good = MockServer::start(512 * 1024, Behavior::default()).await;
+    let digest: [u8; 20] = Sha1::digest(&good.data[..]).into();
+    let dir = tmp_dir("sha1-mirror");
+    let dest = dir.join("mirror.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let mut rx = m.subscribe();
+    let id = m.add(
+        DownloadTask::new(bad.url("file"), dest.clone())
+            .with_sha1(digest)
+            .with_mirrors(vec![good.url("file")]),
+    );
+    assert_eq!(
+        wait_state(&m, id, TaskState::Completed, Duration::from_secs(30)).await,
+        TaskState::Completed
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        *good.data,
+        "换源后必须落地正确内容"
+    );
+    let events = drain_events(&mut rx);
+    assert!(
+        events.iter().any(
+            |e| matches!(e, DownloadEvent::Log { message, .. } if message.contains("切换镜像"))
+        ),
+        "校验失败应触发换源而非原地重试"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn expected_size_mismatch_fails_without_leaving_file() {
+    let server = MockServer::start(256 * 1024, Behavior::default()).await;
+    let dir = tmp_dir("size-bad");
+    let dest = dir.join("size.bin");
+    let m = DownloadManager::new(fast_opts(), 2);
+    let id =
+        m.add(DownloadTask::new(server.url("file"), dest.clone()).with_expected_size(512 * 1024));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Failed, Duration::from_secs(30)).await,
+        TaskState::Failed
+    );
+    assert!(!dest.exists(), "大小不符不应留下目标文件");
+    assert!(!dest.with_file_name("size.bin.part").exists());
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

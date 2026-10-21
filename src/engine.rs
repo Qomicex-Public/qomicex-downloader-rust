@@ -335,12 +335,21 @@ impl Engine {
                 // 校验失败的文件内容不可信：始终清理 .part（重下前 + 最终失败）
                 let part = ctx.task.part_path();
                 let _ = tokio::fs::remove_file(&part).await;
+                let _ = tokio::fs::remove_file(crate::part_meta::meta_path_for(&part)).await;
                 if attempts == 0 {
                     attempts += 1;
-                    ctx.log(
-                        LogLevel::Warn,
-                        "SHA-256 校验失败，删除 .part 自动重下".to_string(),
-                    );
+                    // 内容不符多半是刚落地的源给了坏字节（镜像 200 + 错误 body、错误页贴 200），
+                    // 在同一源上重试只会再拿到同样的字节，换源才可能命中正确内容。
+                    match ctx.mirror_url() {
+                        Some(next) => ctx.log(
+                            LogLevel::Warn,
+                            format!("内容校验失败，删除 .part 并切换镜像重下: {next}"),
+                        ),
+                        None => ctx.log(
+                            LogLevel::Warn,
+                            "内容校验失败，删除 .part 自动重下".to_string(),
+                        ),
+                    }
                     continue;
                 }
             }
@@ -611,7 +620,14 @@ impl Engine {
             });
         }
         part_meta.save(&meta_path).await.ok();
-        finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await?;
+        finalize_verified(
+            part,
+            &ctx.task.dest,
+            ctx.task.sha256,
+            ctx.task.sha1,
+            ctx.task.expected_size,
+        )
+        .await?;
         let _ = tokio::fs::remove_file(&meta_path).await;
         Ok(())
     }
@@ -658,7 +674,14 @@ impl Engine {
                 ctx.stats.downloaded.store(0, Ordering::Relaxed);
                 match try_streamed_once(ctx, part, &url).await {
                     Ok(()) => {
-                        return finalize_verified(part, &ctx.task.dest, ctx.task.sha256).await
+                        return finalize_verified(
+                            part,
+                            &ctx.task.dest,
+                            ctx.task.sha256,
+                            ctx.task.sha1,
+                            ctx.task.expected_size,
+                        )
+                        .await
                     }
                     // 响应头表明该走分片：交给 run_once 处理，不算失败、不计重试。
                     Err(e @ DownloadError::NeedsRanged(_)) => return Err(e),
@@ -1192,7 +1215,14 @@ async fn try_local_reuse(ctx: &Arc<RunContext>, size: u64) -> Result<bool, Downl
     tokio::fs::copy(&src, &part).await?;
     ctx.stats.total.store(size, Ordering::Relaxed);
     ctx.stats.downloaded.store(size, Ordering::Relaxed);
-    finalize_verified(&part, &ctx.task.dest, ctx.task.sha256).await?;
+    finalize_verified(
+        &part,
+        &ctx.task.dest,
+        ctx.task.sha256,
+        ctx.task.sha1,
+        ctx.task.expected_size,
+    )
+    .await?;
     ctx.log(
         LogLevel::Info,
         format!("本地复用: {} -> {}", src.display(), ctx.task.dest.display()),
@@ -1380,11 +1410,19 @@ async fn finalize_part(part: &Path, dest: &Path) -> Result<(), DownloadError> {
     }
 }
 
-/// finalize + 可选 SHA-256 校验（校验失败返回 `ChecksumMismatch`，由 run() 自动重下一次）。
+/// finalize + 内容校验（SHA-256 / SHA-1 / 期望大小）。
+///
+/// 摘要优先于大小：有摘要时大小不符必然也表现为摘要不符，再比一次大小只是重复判定。
+/// 反过来只有大小可用时也必须校验——镜像挂掉时最常见的坏字节就是截断的 body 或
+/// 一段错误页，它们都能通过 HTTP 层（200 + 完整 Content-Length）。
+///
+/// 校验失败返回 `ChecksumMismatch`，由 run() 清理 `.part`、换源并重下一次。
 async fn finalize_verified(
     part: &Path,
     dest: &Path,
     sha256: Option<[u8; 32]>,
+    sha1: Option<[u8; 20]>,
+    expected_size: Option<u64>,
 ) -> Result<(), DownloadError> {
     if let Some(expected) = sha256 {
         let actual = sha256_file(part).await?;
@@ -1392,6 +1430,22 @@ async fn finalize_verified(
             return Err(DownloadError::ChecksumMismatch {
                 expected: hex_encode(&expected),
                 actual: hex_encode(&actual),
+            });
+        }
+    } else if let Some(expected) = sha1 {
+        let actual = sha1_file(part).await?;
+        if actual != expected {
+            return Err(DownloadError::ChecksumMismatch {
+                expected: hex_encode(&expected),
+                actual: hex_encode(&actual),
+            });
+        }
+    } else if let Some(expected) = expected_size {
+        let actual = tokio::fs::metadata(part).await?.len();
+        if actual != expected {
+            return Err(DownloadError::ChecksumMismatch {
+                expected: format!("{expected} 字节"),
+                actual: format!("{actual} 字节"),
             });
         }
     }
@@ -1404,6 +1458,23 @@ async fn sha256_file(path: &Path) -> Result<[u8; 32], DownloadError> {
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// 流式计算文件 SHA-1（Minecraft 仓库与整合包清单用它）。
+async fn sha1_file(path: &Path) -> Result<[u8; 20], DownloadError> {
+    use sha1::{Digest, Sha1};
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha1::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
         let n = file.read(&mut buf).await?;
