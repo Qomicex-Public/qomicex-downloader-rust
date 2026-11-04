@@ -249,6 +249,8 @@ impl DownloadManager {
             let _ = h.await;
         }
         let _ = tokio::fs::remove_file(entry.task.part_path()).await;
+        let _ =
+            tokio::fs::remove_file(crate::part_meta::meta_path_for(&entry.task.part_path())).await;
         let _ = self.inner.events.send(DownloadEvent::StateChanged {
             id,
             state: TaskState::Cancelled,
@@ -679,8 +681,9 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
                 *st = TaskState::Failed;
                 let recent = ctx.recent_errors();
                 let mut detail = format!(
-                    "{e}（url={}，目标={}）",
-                    entry.task.url,
+                    "{}（url={}，目标={}）",
+                    crate::engine::redact_urls_in_text(&e.to_string()),
+                    crate::engine::redact_urls_in_text(&entry.task.url),
                     entry.task.dest.display()
                 );
                 if !recent.is_empty() {

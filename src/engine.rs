@@ -262,6 +262,7 @@ impl RunContext {
 
     /// 带任务前缀的日志：多文件并发时日志可归因到具体任务。
     pub(crate) fn log_task(&self, level: LogLevel, message: String) {
+        let message = redact_urls_in_text(&message);
         self.log(level, format!("[task {}] {message}", self.task.id));
     }
 
@@ -274,9 +275,14 @@ impl RunContext {
         errors.push_back(message);
     }
 
-    /// 取最近失败原因（按时间序）。
+    /// 取最近失败原因（按时间序，URL 已脱敏）。
     pub(crate) fn recent_errors(&self) -> Vec<String> {
-        self.recent_errors.lock().unwrap().iter().cloned().collect()
+        self.recent_errors
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| redact_urls_in_text(e))
+            .collect()
     }
 
     /// 记录某段最近一次 1s 采样的瞬时速度。
@@ -285,6 +291,11 @@ impl RunContext {
             .lock()
             .unwrap()
             .insert(index, (bps, Instant::now()));
+    }
+
+    /// 段完成/中止/拆分后移除速度样本，避免 L1 用已完成段做 peer 基准。
+    pub(crate) fn clear_segment_speed(&self, index: u32) {
+        self.segment_speeds.lock().unwrap().remove(&index);
     }
 
     /// 同批活跃段速度中位数（排除自己；只统计最近 5s 内有采样的段）。
@@ -531,7 +542,7 @@ impl Engine {
         let mut set: JoinSet<SegmentOutcome> = JoinSet::new();
         let mut seg_handles: HashMap<u32, AbortHandle> = HashMap::new();
         let seg_counter = Arc::new(AtomicU32::new(10_000));
-        let max_segments = ctx.task.max_segments.unwrap_or(opts.max_segments) as usize;
+        let max_segments = ctx.task.max_segments.unwrap_or(opts.max_segments).max(1) as usize;
 
         let reporter = spawn_progress_reporter(ctx);
 
@@ -637,11 +648,13 @@ impl Engine {
                                 // 完成段保留：位图重算需要所有段的水位（删掉会让已完成
                                 // 区块重新变回「未覆盖」）。
                                 Ok(()) => {
+                                    ctx.clear_segment_speed(idx);
                                     rounds.remove(&idx);
                                     retry_at.remove(&idx);
                                 }
                                 Err(SegFailure::Cancelled) => {}
                                 Err(SegFailure::RangeIgnored(reason)) => {
+                                    ctx.clear_segment_speed(idx);
                                     ctx.log_task(
                                         LogLevel::Warn,
                                         format!("段 {idx}: 服务器忽略 Range（{reason}），改整文件流式"),
@@ -649,6 +662,7 @@ impl Engine {
                                     range_ignored = Some(reason);
                                 }
                                 Err(SegFailure::RangeInvalid(reason)) => {
+                                    ctx.clear_segment_speed(idx);
                                     ctx.log_task(
                                         LogLevel::Warn,
                                         format!("段 {idx}: Range 响应不可信（{reason}），改整文件流式"),
@@ -675,6 +689,7 @@ impl Engine {
                                         );
                                     } else {
                                         terminal_failures.insert(idx, reason.clone());
+                                        ctx.clear_segment_speed(idx);
                                         ctx.log_task(
                                             LogLevel::Error,
                                             format!("段 {idx} 全部 {limit} 轮重试耗尽: {reason}"),
@@ -691,6 +706,9 @@ impl Engine {
                             // 段任务 panic 属于实现缺陷：保留 .part，带明确原因失败，
                             // 不再静默降级整文件把已下进度删掉。
                             ctx.log_task(LogLevel::Error, format!("段任务异常: {je}"));
+                            for h in seg_handles.values() {
+                                h.abort();
+                            }
                             terminal_error = Some(format!("段任务异常: {je}"));
                             break;
                         }
@@ -907,12 +925,7 @@ impl Engine {
                                     );
                                     continue;
                                 }
-                                None => {
-                                    return Err(DownloadError::Other(format!(
-                                        "{e}（url={url}，已收 {}）",
-                                        human_bytes(ctx.stats.downloaded.load(Ordering::Relaxed))
-                                    )))
-                                }
+                                None => return Err(e),
                             }
                         }
                         let delay = backoff(opts, attempt);
@@ -1281,27 +1294,41 @@ async fn try_segment_once(
                 // L1 软重启：只在末端阶段、且只相对「同批活跃段中位数」判断。
                 // 全程高并发阶段不因速度比例杀段；超限后由 run_segment 关闭该逻辑。
                 if allow_rebuild {
-                    let max_segments = ctx.task.max_segments.unwrap_or(ctx.options.max_segments);
-                    let end_stage = active < max_segments
-                        || remaining
-                            < ctx
-                                .options
-                                .segment_size
-                                .saturating_mul(ctx.options.watchdog_end_stage_factor);
+                    // 旧字段兼容：新字段保持默认时，沿用调用方自定义的
+                    // watchdog_slow_factor / watchdog_slow_samples。
+                    let rebuild_ratio = if (ctx.options.watchdog_rebuild_ratio - 0.25).abs()
+                        < f64::EPSILON
+                        && (ctx.options.watchdog_slow_factor - 0.3).abs() > f64::EPSILON
+                    {
+                        ctx.options.watchdog_slow_factor
+                    } else {
+                        ctx.options.watchdog_rebuild_ratio
+                    };
+                    let rebuild_slow_duration = if ctx.options.watchdog_rebuild_slow_duration
+                        == Duration::from_secs(15)
+                        && ctx.options.watchdog_slow_samples != 5
+                    {
+                        Duration::from_secs(ctx.options.watchdog_slow_samples.max(1) as u64)
+                    } else {
+                        ctx.options.watchdog_rebuild_slow_duration
+                    };
+                    // 只有剩余工作确实接近尾声才启用 L1；不能用 active < max_segments，
+                    // 否则全局许可饱和/等待队列会让大文件提前被判定为末端。
+                    let end_stage = remaining
+                        < ctx
+                            .options
+                            .segment_size
+                            .saturating_mul(ctx.options.watchdog_end_stage_factor);
                     if attempt_started.elapsed() >= ctx.options.watchdog_rebuild_min_runtime
                         && got >= ctx.options.watchdog_rebuild_min_bytes
                         && end_stage
                     {
                         match peer {
                             Some(peer_bps)
-                                if peer_bps > 1024.0
-                                    && smooth
-                                        < peer_bps * ctx.options.watchdog_rebuild_ratio =>
+                                if peer_bps > 1024.0 && smooth < peer_bps * rebuild_ratio =>
                             {
                                 let since = *slow_since.get_or_insert(now);
-                                if now.duration_since(since)
-                                    >= ctx.options.watchdog_rebuild_slow_duration
-                                {
+                                if now.duration_since(since) >= rebuild_slow_duration {
                                     return Err(SegError::Rebuild(snapshot));
                                 }
                             }
@@ -1334,11 +1361,9 @@ async fn try_streamed_once(
     )
     .await
     {
-        Ok(r) => r.map_err(|e| {
-            DownloadError::Other(format!(
-                "等待响应头失败（{url}）: {}",
-                describe_reqwest_error(&e)
-            ))
+        Ok(r) => r.map_err(|e| DownloadError::HttpContext {
+            context: format!("等待响应头 {url}"),
+            source: e,
         })?,
         Err(_) => {
             return Err(DownloadError::Exhausted(format!(
@@ -1434,10 +1459,10 @@ async fn try_streamed_once(
                         last_activity = Instant::now();
                     }
                     Some(Err(e)) => {
-                        return Err(DownloadError::Other(format!(
-                            "流式网络中断（{url}）: {}",
-                            describe_reqwest_error(&e)
-                        )));
+                        return Err(DownloadError::HttpContext {
+                            context: format!("流式读取 {url}"),
+                            source: e,
+                        });
                     }
                     None => {
                         file.sync_all().await?;
@@ -1596,6 +1621,7 @@ async fn try_split(
     if let Some(h) = seg_handles.remove(&seg.index) {
         h.abort();
     }
+    ctx.clear_segment_speed(seg.index);
     let next = seg_counter.fetch_add(1, Ordering::Relaxed);
     let (a, b) = seg.split(next);
     segments.insert(a.index, a);
@@ -1701,6 +1727,52 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1}{}", UNITS[unit])
     }
+}
+
+/// 日志/失败详情里的 URL 脱敏：去掉 userinfo 与 query，避免签名/令牌外泄。
+pub(crate) fn redact_urls_in_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| {
+            let (url, suffix) = split_trailing_punct(token);
+            if url.starts_with("http://") || url.starts_with("https://") {
+                format!("{}{suffix}", redact_url(url))
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_url(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    if !url.username().is_empty() {
+        let _ = url.set_username("***");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("***"));
+    }
+    if url.query().is_some() {
+        url.set_query(Some("redacted"));
+    }
+    url.to_string()
+}
+
+fn split_trailing_punct(token: &str) -> (&str, &str) {
+    let mut end = token.len();
+    for (idx, ch) in token.char_indices().rev() {
+        if matches!(
+            ch,
+            ')' | ']' | '}' | ',' | ';' | '。' | '，' | '；' | '）' | '】'
+        ) {
+            end = idx;
+        } else {
+            break;
+        }
+    }
+    token.split_at(end)
 }
 
 /// reqwest 的 Display 通常只有「error sending request for url (...)」，

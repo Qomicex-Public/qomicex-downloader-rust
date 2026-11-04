@@ -503,14 +503,21 @@ async fn slow_segment_rebuild_does_not_consume_retry_budget() {
 
 #[tokio::test]
 async fn failure_detail_contains_url_and_status() {
-    let server = MockServer::start(1024, Behavior::default()).await;
+    let server = MockServer::start(
+        1024,
+        Behavior {
+            status404: true,
+            ..Default::default()
+        },
+    )
+    .await;
     let dir = tmp_dir("fail-detail");
     let dest = dir.join("missing.bin");
     let mut opts = fast_opts();
     opts.max_retries = 0;
     opts.segment_rounds = 1;
     let m = DownloadManager::new(opts, 1);
-    let url = server.url("status404");
+    let url = server.url("file");
     let id = m.add(DownloadTask::new(url.clone(), dest));
     assert_eq!(
         wait_state(&m, id, TaskState::Failed, Duration::from_secs(20)).await,
