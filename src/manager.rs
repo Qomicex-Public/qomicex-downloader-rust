@@ -22,6 +22,9 @@ struct Entry {
     cancel: Mutex<CancellationToken>,
     handle: StdMutex<Option<JoinHandle<()>>>,
     stats: Arc<DownloadStats>,
+    /// 最近一次失败原因。`state()` 只返回状态，广播事件又可能被 Lagged 吞掉；
+    /// 轮询兜底据此拿到真因，而不是退化成「下载失败」。
+    last_error: StdMutex<Option<String>>,
 }
 
 /// 任务进度快照（从原子统计字段读取，供轮询/桥接层使用）。
@@ -142,6 +145,7 @@ impl DownloadManager {
                 total: AtomicU64::new(0),
                 active_segments: AtomicU32::new(0),
             }),
+            last_error: StdMutex::new(None),
         });
         self.inner.tasks.write().unwrap().insert(id, entry);
         let _ = self.inner.events.send(DownloadEvent::StateChanged {
@@ -199,6 +203,7 @@ impl DownloadManager {
             *st = TaskState::Queued;
         }
         *entry.cancel.lock().await = CancellationToken::new();
+        *entry.last_error.lock().unwrap() = None;
         self.inner.queue.lock().unwrap().push_back(id);
         self.inner.dispatch.notify_one();
         Ok(())
@@ -224,6 +229,7 @@ impl DownloadManager {
             *st = TaskState::Queued;
         }
         *entry.cancel.lock().await = CancellationToken::new();
+        *entry.last_error.lock().unwrap() = None;
         self.inner.queue.lock().unwrap().push_back(id);
         self.inner.dispatch.notify_one();
         Ok(())
@@ -261,6 +267,16 @@ impl DownloadManager {
     /// 查询任务状态。
     pub async fn state(&self, id: TaskId) -> Result<TaskState, DownloadError> {
         Ok(*self.entry(id)?.state.read().unwrap())
+    }
+
+    /// 查询任务最近一次失败原因（成功/进行中为 None）。
+    ///
+    /// 用于广播事件丢失时的轮询兜底：`state()` 只有枚举值，调用方不能据此
+    /// 还原「哪个 URL、什么错误」，否则线上只剩一句无信息量的「下载失败」。
+    pub async fn last_error(&self, id: TaskId) -> Option<String> {
+        self.entry(id)
+            .ok()
+            .and_then(|e| e.last_error.lock().unwrap().clone())
     }
 
     /// 查询任务进度快照（已下载/总量/活跃段数）。
@@ -532,6 +548,11 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
     // 上层批次误以为任务在正常推进。
     let dest_key = crate::engine::normalize_dest(&entry.task.dest);
     let Some(_dest_guard) = DestGuard::acquire(inner.dest_locks.clone(), dest_key) else {
+        let detail = format!(
+            "目标文件正在被另一个下载任务写入: {}",
+            entry.task.dest.display()
+        );
+        *entry.last_error.lock().unwrap() = Some(detail.clone());
         {
             let mut st = entry.state.write().unwrap();
             *st = TaskState::Failed;
@@ -539,10 +560,7 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         let _ = inner.events.send(DownloadEvent::StateChanged {
             id,
             state: TaskState::Failed,
-            detail: Some(format!(
-                "目标文件正在被另一个下载任务写入: {}",
-                entry.task.dest.display()
-            )),
+            detail: Some(detail),
         });
         drop(permit);
         inner.dispatch.notify_one();
@@ -600,6 +618,23 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         });
     }
 
+    let max_segments = entry
+        .task
+        .max_segments
+        .unwrap_or(inner.options.max_segments);
+    let _ = inner.events.send(DownloadEvent::Log {
+        level: LogLevel::Info,
+        message: format!(
+            "[task {id}] 开始: url={} dest={} expected_size={:?} mirrors={} max_segments={} h1={}",
+            entry.task.url,
+            entry.task.dest.display(),
+            entry.task.expected_size,
+            entry.task.mirror_urls.len(),
+            max_segments,
+            use_h1,
+        ),
+    });
+
     let ctx = Arc::new(RunContext {
         task: entry.task.clone(),
         cancel: entry.cancel.lock().await.clone(),
@@ -620,6 +655,8 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         dead_hosts: inner.host_dead.clone(),
         ip_health: inner.ip_health.clone(),
         ranged_attempted: AtomicBool::new(false),
+        recent_errors: StdMutex::new(std::collections::VecDeque::new()),
+        segment_speeds: StdMutex::new(std::collections::HashMap::new()),
     });
 
     let result = inner.engine.run(&ctx).await;
@@ -634,12 +671,24 @@ async fn worker(inner: &Arc<Inner>, entry: &Arc<Entry>, permit: tokio::sync::Own
         match result {
             Ok(()) => {
                 *st = TaskState::Completed;
+                *entry.last_error.lock().unwrap() = None;
                 (TaskState::Completed, None)
             }
             Err(DownloadError::Cancelled) => (*st, None),
             Err(e) => {
                 *st = TaskState::Failed;
-                (TaskState::Failed, Some(e.to_string()))
+                let recent = ctx.recent_errors();
+                let mut detail = format!(
+                    "{e}（url={}，目标={}）",
+                    entry.task.url,
+                    entry.task.dest.display()
+                );
+                if !recent.is_empty() {
+                    detail.push_str("；最近错误: ");
+                    detail.push_str(&recent.join(" | "));
+                }
+                *entry.last_error.lock().unwrap() = Some(detail.clone());
+                (TaskState::Failed, Some(detail))
             }
         }
     };

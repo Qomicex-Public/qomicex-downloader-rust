@@ -434,6 +434,96 @@ async fn watchdog_rebuilds_stalled_segment() {
 }
 
 #[tokio::test]
+async fn slow_segment_rebuild_does_not_consume_retry_budget() {
+    // 连接 1 慢（100KB/s）、后续连接快（5MB/s）。慢段应触发 L1 软重启并换到快连接，
+    // 但绝不能扣 max_retries：这里 max_retries=0、segment_rounds=1，一旦走 Retryable
+    // 分支就会直接失败。Completed 即证明 L1 预算独立。
+    let server = MockServer::start(
+        2 * 1024 * 1024,
+        Behavior {
+            throttle: Some((50_000, 500_000)),
+            throttle_skip_first: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("l1-rebuild");
+    let dest = dir.join("l1.bin");
+    let mut opts = fast_opts();
+    opts.segment_size = 1024 * 1024;
+    opts.split_threshold = 0;
+    opts.max_segments = 2;
+    opts.max_total_segments = 4;
+    opts.max_retries = 0;
+    opts.segment_rounds = 1;
+    opts.watchdog_idle_timeout = Duration::from_secs(10);
+    opts.watchdog_first_byte_timeout = Duration::from_secs(5);
+    opts.watchdog_rebuild_min_runtime = Duration::from_millis(500);
+    opts.watchdog_rebuild_min_bytes = 1024;
+    opts.watchdog_rebuild_slow_duration = Duration::from_secs(1);
+    opts.watchdog_rebuild_ratio = 0.5;
+    opts.watchdog_rebuild_limit = 2;
+    opts.watchdog_rebuild_cooldown = Duration::from_millis(10);
+    let m = DownloadManager::new(opts, 1);
+    let mut rx = m.subscribe();
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let logs_task = {
+        let logs = logs.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(DownloadEvent::Log { message, .. }) => {
+                        logs.lock().unwrap().push(message);
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+    let id = m.add(DownloadTask::new(server.url("file"), dest.clone()));
+    let st = wait_state(&m, id, TaskState::Completed, Duration::from_secs(60)).await;
+    logs_task.abort();
+    let logs = logs.lock().unwrap().clone();
+    let bytes = std::fs::read(&dest).unwrap_or_default();
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        st,
+        TaskState::Completed,
+        "慢段软重启不应扣重试预算；日志: {logs:#?}"
+    );
+    assert_eq!(bytes, *server.data, "内容一致");
+    assert!(
+        logs.iter().any(|m| m.contains("type=L1_rebuild")),
+        "应产生 L1 软重启日志；日志: {logs:#?}"
+    );
+}
+
+#[tokio::test]
+async fn failure_detail_contains_url_and_status() {
+    let server = MockServer::start(1024, Behavior::default()).await;
+    let dir = tmp_dir("fail-detail");
+    let dest = dir.join("missing.bin");
+    let mut opts = fast_opts();
+    opts.max_retries = 0;
+    opts.segment_rounds = 1;
+    let m = DownloadManager::new(opts, 1);
+    let url = server.url("status404");
+    let id = m.add(DownloadTask::new(url.clone(), dest));
+    assert_eq!(
+        wait_state(&m, id, TaskState::Failed, Duration::from_secs(20)).await,
+        TaskState::Failed
+    );
+    let detail = m.last_error(id).await.unwrap_or_default();
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(detail.contains("404"), "失败原因应含状态码: {detail}");
+    assert!(detail.contains(&url), "失败原因应含 URL: {detail}");
+}
+
+#[tokio::test]
 async fn dynamic_split_on_speedup() {
     // 连接 1 慢速（500KB/s），后续连接快速（5MB/s）→ 初始单段 + 周期性拆分 → 段数逐步提升
     let server = MockServer::start(
@@ -1122,6 +1212,7 @@ async fn dead_source_without_bytes_switches_immediately() {
     // 默认 5 次重试、1s 看门狗：旧实现约 2×5×1=10s 才换源。
     opts.max_retries = 5;
     opts.watchdog_idle_timeout = Duration::from_secs(1);
+    opts.watchdog_first_byte_timeout = Duration::from_secs(1);
     let m = DownloadManager::new(opts, 2);
 
     let start = Instant::now();

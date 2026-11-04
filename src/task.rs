@@ -89,10 +89,34 @@ pub struct DownloadOptions {
     pub split_threshold: u64,
     /// 看门狗：段内无任何数据到达超过该时长 → 重建段。
     pub watchdog_idle_timeout: Duration,
+    /// 看门狗：等待响应体**首字节**的超时。比 idle 短，用于快速识别
+    /// 「回了响应头但 body 一直不来」的死节点（实测镜像挂起即此形态）。
+    pub watchdog_first_byte_timeout: Duration,
     /// 看门狗：当前速度持续低于平滑速度 × 该系数 → 重建段。
+    ///
+    /// 已由 [`Self::watchdog_rebuild_ratio`] 取代，保留字段仅为兼容既有调用方。
     pub watchdog_slow_factor: f64,
     /// 看门狗：连续多少次低速采样触发重建。
+    ///
+    /// 已由 [`Self::watchdog_rebuild_slow_duration`] 取代，保留字段仅为兼容既有调用方。
     pub watchdog_slow_samples: u32,
+    /// 看门狗 L1 软重启：段已运行超过该时长才允许触发（避免刚启动误杀）。
+    pub watchdog_rebuild_min_runtime: Duration,
+    /// 看门狗 L1 软重启：段至少已接收的字节数（避免小段被反复重启）。
+    pub watchdog_rebuild_min_bytes: u64,
+    /// 看门狗 L1 软重启：持续低速达到该时长才触发。
+    pub watchdog_rebuild_slow_duration: Duration,
+    /// 看门狗 L1 软重启：低于同批活跃段速度中位数 × 该系数视为「异常慢」。
+    pub watchdog_rebuild_ratio: f64,
+    /// 看门狗 L1 软重启：单段最多软重启次数；超限后容忍慢速继续传，不判失败。
+    pub watchdog_rebuild_limit: u32,
+    /// 看门狗 L1 软重启：两次软重启之间的冷却时间（防抖动）。
+    pub watchdog_rebuild_cooldown: Duration,
+    /// 末端阶段判定：剩余字节 < `segment_size × 该系数` 时启用 L1 软重启。
+    pub watchdog_end_stage_factor: u64,
+    /// 单个段最多经历几轮完整重试（每轮重新获得 `max_retries` 预算）。
+    /// 单段耗尽不再让整个文件改走单连接流式。
+    pub segment_rounds: u32,
     /// 动态拆分：速度采样周期。
     pub split_sample_interval: Duration,
     /// 进度事件节流周期。
@@ -150,9 +174,18 @@ impl Default for DownloadOptions {
             max_total_segments: 64,
             max_download_speed: None,
             split_threshold: 10 * 1024 * 1024,
-            watchdog_idle_timeout: Duration::from_secs(30),
+            watchdog_idle_timeout: Duration::from_secs(60),
+            watchdog_first_byte_timeout: Duration::from_secs(20),
             watchdog_slow_factor: 0.3,
             watchdog_slow_samples: 5,
+            watchdog_rebuild_min_runtime: Duration::from_secs(10),
+            watchdog_rebuild_min_bytes: 1024 * 1024,
+            watchdog_rebuild_slow_duration: Duration::from_secs(15),
+            watchdog_rebuild_ratio: 0.25,
+            watchdog_rebuild_limit: 3,
+            watchdog_rebuild_cooldown: Duration::from_secs(2),
+            watchdog_end_stage_factor: 2,
+            segment_rounds: 3,
             split_sample_interval: Duration::from_secs(2),
             progress_throttle: Duration::from_millis(150),
             global_progress_interval: Duration::from_millis(250),

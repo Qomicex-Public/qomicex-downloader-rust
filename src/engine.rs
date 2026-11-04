@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Qomicex Launcher Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -76,6 +76,12 @@ pub(crate) struct RunContext {
     /// 防止 `run_ranged` 降级整文件 → `run_streamed` 再嗅探 → 又切回分片
     /// 的死循环。每次 `run_once` 重置。
     pub ranged_attempted: AtomicBool,
+    /// 本任务最近失败原因（环形，最多 8 条）。任务终态时由 manager 附到
+    /// `StateChanged.detail`，避免广播事件被 Lagged 吞掉后用户只看到「下载失败」。
+    pub recent_errors: StdMutex<VecDeque<String>>,
+    /// 本任务各段最近一次 1s 采样的瞬时速度（bps）。L1 软重启以同批活跃段
+    /// 中位数为基准，而不是该段自身历史峰值。
+    pub segment_speeds: StdMutex<HashMap<u32, (f64, Instant)>>,
 }
 
 /// 死源拉黑时长。短于常见 CDN 抖动恢复时间，又足够让同一批大量小文件跳过它。
@@ -254,6 +260,51 @@ impl RunContext {
         let _ = self.events.send(DownloadEvent::Log { level, message });
     }
 
+    /// 带任务前缀的日志：多文件并发时日志可归因到具体任务。
+    pub(crate) fn log_task(&self, level: LogLevel, message: String) {
+        self.log(level, format!("[task {}] {message}", self.task.id));
+    }
+
+    /// 记录一条最近失败原因（环形，最多 8 条）。
+    pub(crate) fn record_error(&self, message: String) {
+        let mut errors = self.recent_errors.lock().unwrap();
+        if errors.len() >= 8 {
+            errors.pop_front();
+        }
+        errors.push_back(message);
+    }
+
+    /// 取最近失败原因（按时间序）。
+    pub(crate) fn recent_errors(&self) -> Vec<String> {
+        self.recent_errors.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// 记录某段最近一次 1s 采样的瞬时速度。
+    pub(crate) fn note_segment_speed(&self, index: u32, bps: f64) {
+        self.segment_speeds
+            .lock()
+            .unwrap()
+            .insert(index, (bps, Instant::now()));
+    }
+
+    /// 同批活跃段速度中位数（排除自己；只统计最近 5s 内有采样的段）。
+    /// 只有一个活跃段时返回 None：没有横向基准时不做 L1 软重启，只保留 idle 超时。
+    pub(crate) fn peer_median_speed(&self, exclude: u32) -> Option<f64> {
+        let mut speeds: Vec<f64> = self
+            .segment_speeds
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(index, (_, at))| **index != exclude && at.elapsed() < Duration::from_secs(5))
+            .map(|(_, (bps, _))| *bps)
+            .collect();
+        if speeds.is_empty() {
+            return None;
+        }
+        speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(speeds[speeds.len() / 2])
+    }
+
     /// 当前协议选择：HTTP/3 开启且存在 h3 client 时用它，否则用 HTTP/2。
     fn h3_active(&self) -> bool {
         self.use_h3.load(Ordering::Relaxed) && self.h3.is_some()
@@ -292,7 +343,10 @@ where
             ctx.use_h3.store(false, Ordering::Relaxed);
             ctx.log(
                 LogLevel::Warn,
-                format!("HTTP/3 连接失败，运行时回退 HTTP/2: {e}"),
+                format!(
+                    "HTTP/3 连接失败，运行时回退 HTTP/2: {}",
+                    describe_reqwest_error(&e)
+                ),
             );
             build(&ctx.h2).await
         }
@@ -305,7 +359,12 @@ pub(crate) struct Engine;
 /// 段失败类别。
 enum SegFailure {
     Cancelled,
+    /// 真错误：重试轮次耗尽（保留 `.part`，由上层决定是否让用户重试/续传）。
     Exhausted(String),
+    /// 服务器忽略 Range：必须改走整文件流式（唯一会删除 `.part` 的降级）。
+    RangeIgnored(String),
+    /// 服务器对 Range 的响应不可信（Content-Range 缺失/与请求不符）：同样改走整文件流式。
+    RangeInvalid(String),
 }
 
 type SegmentOutcome = (u32, Result<(), SegFailure>);
@@ -313,13 +372,19 @@ type SegmentOutcome = (u32, Result<(), SegFailure>);
 #[derive(Debug)]
 enum SegError {
     Cancelled,
+    /// 真错误：扣 `max_retries` 预算。
     Retryable(String),
+    /// L1 软重启：慢速但有进展，不扣重试预算，重新入队/重开连接。
+    Rebuild(String),
     /// 非瞬态错误（4xx，除 408/429）：重试同一源没有意义，立即换镜像。
     Fatal(String),
     /// 服务器对带 Range 的请求返回全文件 200：非瞬态故障，重试/换段均无意义，
     /// 立即放弃分片路径转整文件流式（实测 dpdns.org 镜像：HEAD 宣称
     /// Accept-Ranges: bytes，GET+Range 却回 200，旧逻辑每段空转 5 次重试）。
     RangeIgnored,
+    /// 服务器对 Range 的响应头不可信（Content-Range 缺失/与请求不符）：
+    /// 立即放弃分片路径转整文件流式，避免写坏相邻段。
+    RangeInvalid(String),
 }
 
 impl Engine {
@@ -341,11 +406,11 @@ impl Engine {
                     // 内容不符多半是刚落地的源给了坏字节（镜像 200 + 错误 body、错误页贴 200），
                     // 在同一源上重试只会再拿到同样的字节，换源才可能命中正确内容。
                     match ctx.mirror_url() {
-                        Some(next) => ctx.log(
+                        Some(next) => ctx.log_task(
                             LogLevel::Warn,
                             format!("内容校验失败，删除 .part 并切换镜像重下: {next}"),
                         ),
-                        None => ctx.log(
+                        None => ctx.log_task(
                             LogLevel::Warn,
                             "内容校验失败，删除 .part 自动重下".to_string(),
                         ),
@@ -470,7 +535,13 @@ impl Engine {
 
         let reporter = spawn_progress_reporter(ctx);
 
-        let mut degraded = false;
+        // L1 软重启不扣重试预算；L2 真错误才扣。段级「轮次」用于单段耗尽后
+        // 再给一整轮 max_retries，避免一个坏段把整个文件拖去单连接流式。
+        let mut rounds: HashMap<u32, u32> = HashMap::new();
+        let mut retry_at: HashMap<u32, Instant> = HashMap::new();
+        let mut terminal_failures: HashMap<u32, String> = HashMap::new();
+        let mut range_ignored: Option<String> = None;
+        let mut terminal_error: Option<String> = None;
         // issue #6：拆分只有在确实提速时才继续。每次拆分记录当时速率，下一拍比较；
         // 连续两拍看不出提升就停止拆分（连接数不是瓶颈时继续拆只增加开销与竞争）。
         let mut split_enabled = true;
@@ -479,11 +550,18 @@ impl Engine {
         let mut smooth_speed = 0.0f64;
         let mut last_sample = (Instant::now(), ctx.stats.downloaded.load(Ordering::Relaxed));
         loop {
-            // 启动待运行段（受并发上限约束）
-            if !degraded {
+            // 启动待运行段（受并发上限约束）。拿不到全局段许可时**不启动**，
+            // 但绝不把它当成段失败：许可排队只是并发上限，不是下载错误。
+            if range_ignored.is_none() {
+                let now = Instant::now();
                 let mut pending: Vec<Segment> = segments
                     .values()
-                    .filter(|s| !s.finished() && !seg_handles.contains_key(&s.index))
+                    .filter(|s| {
+                        !s.finished()
+                            && !seg_handles.contains_key(&s.index)
+                            && !terminal_failures.contains_key(&s.index)
+                            && retry_at.get(&s.index).is_none_or(|at| *at <= now)
+                    })
                     .cloned()
                     .collect();
                 pending.sort_by_key(|s| s.index);
@@ -511,10 +589,33 @@ impl Engine {
                 break;
             }
             if seg_handles.is_empty() && !all_finished {
-                // 某段永久失败且无活跃段 → 降级整文件重试
-                degraded = true;
-                ctx.log(LogLevel::Warn, "分片重试耗尽，降级整文件重试".to_string());
-                break;
+                if range_ignored.is_some() {
+                    break;
+                }
+                // 还有等待全局许可或重试冷却的段：继续等，不判失败、不删 .part。
+                // 这里必须主动 sleep：JoinSet 为空时 join_next() 会立刻返回 None，
+                // 直接进 select 会变成忙循环。
+                let waiting = segments.values().any(|s| {
+                    !s.finished()
+                        && !terminal_failures.contains_key(&s.index)
+                        && !seg_handles.contains_key(&s.index)
+                });
+                if !waiting {
+                    let mut reasons: Vec<String> = terminal_failures.values().cloned().collect();
+                    reasons.sort();
+                    terminal_error = Some(reasons.join("; "));
+                    break;
+                }
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => {
+                        reporter.abort();
+                        refresh_bitmap(&mut part_meta, &segments);
+                        part_meta.save(&meta_path).await.ok();
+                        return Err(DownloadError::Cancelled);
+                    }
+                    _ = sleep(Duration::from_millis(200)) => {}
+                }
+                continue;
             }
 
             tokio::select! {
@@ -535,20 +636,63 @@ impl Engine {
                             match result {
                                 // 完成段保留：位图重算需要所有段的水位（删掉会让已完成
                                 // 区块重新变回「未覆盖」）。
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    rounds.remove(&idx);
+                                    retry_at.remove(&idx);
+                                }
                                 Err(SegFailure::Cancelled) => {}
+                                Err(SegFailure::RangeIgnored(reason)) => {
+                                    ctx.log_task(
+                                        LogLevel::Warn,
+                                        format!("段 {idx}: 服务器忽略 Range（{reason}），改整文件流式"),
+                                    );
+                                    range_ignored = Some(reason);
+                                }
+                                Err(SegFailure::RangeInvalid(reason)) => {
+                                    ctx.log_task(
+                                        LogLevel::Warn,
+                                        format!("段 {idx}: Range 响应不可信（{reason}），改整文件流式"),
+                                    );
+                                    range_ignored = Some(reason);
+                                }
                                 Err(SegFailure::Exhausted(reason)) => {
-                                    ctx.log(LogLevel::Error, format!("段 {idx} 重试耗尽: {reason}"));
-                                    degraded = true;
+                                    let round = rounds.entry(idx).or_insert(0);
+                                    *round += 1;
+                                    let limit = ctx.options.segment_rounds.max(1);
+                                    ctx.record_error(format!("seg {idx}: {reason}"));
+                                    if *round < limit {
+                                        // 单段耗尽不等于整文件失败：保留已写进度，
+                                        // 冷却后重新入队，再给一整轮重试预算。
+                                        retry_at.insert(
+                                            idx,
+                                            Instant::now() + Duration::from_secs(1),
+                                        );
+                                        ctx.log_task(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "段 {idx} 第 {round}/{limit} 轮重试耗尽，保留进度稍后重试: {reason}"
+                                            ),
+                                        );
+                                    } else {
+                                        terminal_failures.insert(idx, reason.clone());
+                                        ctx.log_task(
+                                            LogLevel::Error,
+                                            format!("段 {idx} 全部 {limit} 轮重试耗尽: {reason}"),
+                                        );
+                                    }
                                 }
                             }
                         }
                         Some(Err(je)) => {
+                            ctx.stats.active_segments.fetch_sub(1, Ordering::Relaxed);
                             if je.is_cancelled() {
                                 continue; // 被动态拆分 abort，忽略
                             }
-                            ctx.log(LogLevel::Error, format!("段任务异常: {je}"));
-                            degraded = true;
+                            // 段任务 panic 属于实现缺陷：保留 .part，带明确原因失败，
+                            // 不再静默降级整文件把已下进度删掉。
+                            ctx.log_task(LogLevel::Error, format!("段任务异常: {je}"));
+                            terminal_error = Some(format!("段任务异常: {je}"));
+                            break;
                         }
                         None => {}
                     }
@@ -570,7 +714,6 @@ impl Engine {
                     }
                     last_sample = (Instant::now(), now_dl);
 
-                    if degraded { continue; }
                     // 上一拍拆分后的效果评估。
                     if let Some(base) = split_baseline.take() {
                         if smooth_speed > base * 1.1 {
@@ -579,7 +722,7 @@ impl Engine {
                             split_stalls += 1;
                             if split_stalls >= 2 && split_enabled {
                                 split_enabled = false;
-                                ctx.log(
+                                ctx.log_task(
                                     LogLevel::Info,
                                     "拆分连续无提速，停止继续拆分（issue #6）".to_string(),
                                 );
@@ -601,8 +744,21 @@ impl Engine {
         }
         reporter.abort();
 
-        if degraded {
+        // 服务器忽略 Range 是唯一需要「整文件流式」的降级：分片请求必然全失败，
+        // 删 .part 重下是合理的。其余失败一律保留 .part 供续传。
+        if let Some(reason) = range_ignored {
+            ctx.log_task(
+                LogLevel::Warn,
+                format!("服务器忽略 Range，改整文件流式下载: {reason}"),
+            );
             return self.download_full_fallback(ctx, part, total).await;
+        }
+        if let Some(err) = terminal_error {
+            refresh_bitmap(&mut part_meta, &segments);
+            part_meta.save(&meta_path).await.ok();
+            return Err(DownloadError::Exhausted(format!(
+                "分片下载失败（.part 已保留，可重试续传）: {err}"
+            )));
         }
 
         // 完成判定：所有块都确认写完，且文件长度等于总长（issue #2）。只比长度
@@ -653,7 +809,10 @@ impl Engine {
         if let Some(parent) = part.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        ctx.log(LogLevel::Info, format!("流式路径开始: {part:?}"));
+        ctx.log_task(
+            LogLevel::Info,
+            format!("流式路径开始: {part:?} url={}", ctx.current_url()),
+        );
 
         // 流式路径同样定期上报进度（否则下载中心进度会卡在 0% 直到完成）。
         let reporter = spawn_progress_reporter(ctx);
@@ -692,6 +851,7 @@ impl Engine {
                         // 旧实现要耗尽 max_retries × idle 才轮换：默认 5×30s，实测单文件
                         // 约 5 分钟才用上可用镜像。
                         let got_bytes = ctx.stats.downloaded.load(Ordering::Relaxed) > 0;
+                        ctx.record_error(format!("stream url={url} attempt={attempt}: {e}"));
                         // 4xx（除 408/429）：重试同一源没有意义，直接换镜像。
                         let fatal_status = match &e {
                             DownloadError::HttpStatus { status, .. } => {
@@ -703,7 +863,7 @@ impl Engine {
                             if let Some(next) = ctx.mirror_url() {
                                 attempt = 0;
                                 url = next;
-                                ctx.log(
+                                ctx.log_task(
                                     LogLevel::Warn,
                                     format!("非瞬态错误（{e}），立即切换镜像 {url}"),
                                 );
@@ -717,7 +877,7 @@ impl Engine {
                             if let Some(next) = ctx.mirror_url() {
                                 attempt = 0;
                                 url = next;
-                                ctx.log(LogLevel::Warn, format!("连续无进展，切换镜像 {url}"));
+                                ctx.log_task(LogLevel::Warn, format!("连续无进展，切换镜像 {url}"));
                                 continue;
                             }
                         }
@@ -728,7 +888,7 @@ impl Engine {
                             if let Some(next) = ctx.mirror_url() {
                                 attempt = 0;
                                 url = next;
-                                ctx.log(
+                                ctx.log_task(
                                     LogLevel::Warn,
                                     format!("源 {url} 未返回数据，立即切换镜像"),
                                 );
@@ -741,17 +901,22 @@ impl Engine {
                                 Some(next) => {
                                     attempt = 0;
                                     url = next;
-                                    ctx.log(
+                                    ctx.log_task(
                                         LogLevel::Warn,
                                         format!("流式重试耗尽，切换镜像 {url}"),
                                     );
                                     continue;
                                 }
-                                None => return Err(e),
+                                None => {
+                                    return Err(DownloadError::Other(format!(
+                                        "{e}（url={url}，已收 {}）",
+                                        human_bytes(ctx.stats.downloaded.load(Ordering::Relaxed))
+                                    )))
+                                }
                             }
                         }
                         let delay = backoff(opts, attempt);
-                        ctx.log(
+                        ctx.log_task(
                             LogLevel::Warn,
                             format!("流式下载第 {attempt} 次重试（{e}）"),
                         );
@@ -776,19 +941,51 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
     let max_retries = ctx.task.max_retries.unwrap_or(ctx.options.max_retries);
     let mut attempt: u32 = 0;
     let mut attempt_url = ctx.current_url();
+    // L1 软重启预算：与 max_retries 完全独立，超限后不再杀段，只保留 idle 超时。
+    let mut rebuilds: u32 = 0;
+    let mut allow_rebuild = true;
     loop {
         if ctx.cancel.is_cancelled() {
             return (idx, Err(SegFailure::Cancelled));
         }
-        match try_segment_once(&ctx, &mut seg, &attempt_url).await {
+        match try_segment_once(&ctx, &mut seg, &attempt_url, allow_rebuild).await {
             Ok(()) => return (idx, Ok(())),
             Err(SegError::Cancelled) => return (idx, Err(SegFailure::Cancelled)),
+            Err(SegError::Rebuild(snapshot)) => {
+                let limit = ctx.options.watchdog_rebuild_limit.max(1);
+                if rebuilds >= limit {
+                    // 超限后不再杀段：慢就慢，只要还在出字节就让它传完。
+                    allow_rebuild = false;
+                    ctx.log_task(
+                        LogLevel::Warn,
+                        format!(
+                            "[watchdog] type=L1_rebuild_exhausted seg={idx} rebuild={rebuilds}/{limit} {snapshot}"
+                        ),
+                    );
+                    continue;
+                }
+                rebuilds += 1;
+                ctx.log_task(
+                    LogLevel::Warn,
+                    format!(
+                        "[watchdog] type=L1_rebuild seg={idx} rebuild={rebuilds}/{limit} {snapshot}"
+                    ),
+                );
+                // 冷却后重开连接；已写字节保留，从当前 offset 续传。
+                let cooldown = ctx.options.watchdog_rebuild_cooldown;
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return (idx, Err(SegFailure::Cancelled)),
+                    _ = sleep(cooldown) => {}
+                }
+                continue;
+            }
             Err(SegError::Fatal(reason)) => {
+                ctx.record_error(format!("seg {idx} url={attempt_url}: {reason}"));
                 // 4xx（非 408/429）：该源这条路径不存在/无权限，重试同一源只是空转。
                 if let Some(next) = ctx.mirror_url() {
                     attempt = 0;
                     attempt_url = next;
-                    ctx.log(
+                    ctx.log_task(
                         LogLevel::Warn,
                         format!("段 {idx}: 非瞬态错误（{reason}），立即切换镜像 {attempt_url}"),
                     );
@@ -798,18 +995,29 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
             }
             Err(SegError::RangeIgnored) => {
                 // ponytail: 不轮换镜像重试分片——镜像对 Range 的支持未知，直接整文件流式最稳
-                ctx.log(
+                ctx.log_task(
                     LogLevel::Warn,
                     format!("段 {idx}: 服务器忽略 Range 请求，转整文件下载"),
                 );
                 return (
                     idx,
-                    Err(SegFailure::Exhausted("服务器忽略 Range 请求".into())),
+                    Err(SegFailure::RangeIgnored("服务器忽略 Range 请求".into())),
                 );
             }
+            Err(SegError::RangeInvalid(reason)) => {
+                // 响应头与请求区间不符：写进去会污染相邻段，立即转整文件流式。
+                ctx.log_task(
+                    LogLevel::Warn,
+                    format!("段 {idx}: Range 响应不可信（{reason}），转整文件下载"),
+                );
+                return (idx, Err(SegFailure::RangeInvalid(reason)));
+            }
             Err(SegError::Retryable(reason)) => {
+                ctx.record_error(format!(
+                    "seg {idx} url={attempt_url} attempt={attempt}: {reason}"
+                ));
                 // 快速失败：这一段在本源上一个字节都没拿到 → 源是死的，立刻换源，
-                // 不在同一源上耗尽重试预算（默认 5 次 × 看门狗 30s）。
+                // 不在同一源上耗尽重试预算。
                 let progressed = seg.downloaded.load(Ordering::Relaxed) > 0;
                 if !progressed {
                     ctx.mark_source_dead(&attempt_url);
@@ -817,7 +1025,7 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                         if let Some(next) = ctx.mirror_url() {
                             attempt = 0;
                             attempt_url = next;
-                            ctx.log(
+                            ctx.log_task(
                                 LogLevel::Warn,
                                 format!("段 {idx}: 源无响应，立即切换镜像 {attempt_url}"),
                             );
@@ -831,9 +1039,9 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                         Some(next) => {
                             attempt = 0;
                             attempt_url = next;
-                            ctx.log(
+                            ctx.log_task(
                                 LogLevel::Warn,
-                                format!("段 {idx} 重试耗尽，切换镜像 {attempt_url}"),
+                                format!("段 {idx} 重试耗尽（{reason}），切换镜像 {attempt_url}"),
                             );
                             continue;
                         }
@@ -841,7 +1049,7 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                     }
                 }
                 let delay = backoff(&ctx.options, attempt);
-                ctx.log(
+                ctx.log_task(
                     LogLevel::Warn,
                     format!("段 {idx} 第 {attempt} 次重试（{reason}）"),
                 );
@@ -859,11 +1067,14 @@ async fn try_segment_once(
     ctx: &Arc<RunContext>,
     seg: &mut Segment,
     url: &str,
+    allow_rebuild: bool,
 ) -> Result<(), SegError> {
     let from = seg.start + seg.downloaded.load(Ordering::Relaxed);
     if from > seg.end {
         return Ok(());
     }
+    let attempt_started = Instant::now();
+    let attempt_start_bytes = seg.downloaded.load(Ordering::Relaxed);
     let range = format!("bytes={from}-{}", seg.end);
     // aria2 式独立连接：分段请求一律走 HTTP/1.1 客户端，hyper 连接池为并发段自动
     // 建立多条 TCP——HTTP/2 多路复用会把所有段压进同一条流，高 RTT / 按连接限速
@@ -879,10 +1090,26 @@ async fn try_segment_once(
         .header(reqwest::header::RANGE, range.clone())
         .send();
     let resp = match tokio::time::timeout(ctx.options.timeout, send).await {
-        Ok(r) => r.map_err(|e| SegError::Retryable(e.to_string()))?,
-        Err(_) => return Err(SegError::Retryable("等待响应头超时".into())),
+        Ok(r) => r.map_err(|e| SegError::Retryable(describe_reqwest_error(&e)))?,
+        Err(_) => {
+            return Err(SegError::Retryable(format!(
+                "等待响应头超时 {}s（{url}，range={range}）",
+                ctx.options.timeout.as_secs()
+            )))
+        }
     };
     let status = resp.status();
+    ctx.log_task(
+        LogLevel::Debug,
+        format!(
+            "段 {} 响应: {status} url={url} range={range} content_range={:?} content_length={:?}",
+            seg.index,
+            resp.headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            content_length(resp.headers()),
+        ),
+    );
     if status == reqwest::StatusCode::OK {
         // 200 = 全文件响应：仅当段本身覆盖整个文件且从头开始时合法（服务器对整文件 Range 返回 200）
         let total = ctx.stats.total.load(Ordering::Relaxed);
@@ -923,13 +1150,17 @@ async fn try_segment_once(
             Some((start, end, total)) => {
                 let bad_total = matches!(total, Some(t) if total_known > 0 && t != total_known);
                 if start != from || end > seg.end || bad_total {
-                    return Err(SegError::Retryable(format!(
+                    return Err(SegError::RangeInvalid(format!(
                         "Content-Range 与请求不符: 收到 {start}-{end}/{total:?}，请求 {from}-{}/{}",
                         seg.end, total_known
                     )));
                 }
             }
-            None => return Err(SegError::Retryable("206 响应缺少合法 Content-Range".into())),
+            None => {
+                return Err(SegError::RangeInvalid(
+                    "206 响应缺少合法 Content-Range".into(),
+                ))
+            }
         }
     }
 
@@ -948,12 +1179,16 @@ async fn try_segment_once(
 
     let mut stream = resp.bytes_stream();
     let idle_timeout = ctx.options.watchdog_idle_timeout;
-    let slow_factor = ctx.options.watchdog_slow_factor;
-    let slow_samples = ctx.options.watchdog_slow_samples;
-    let mut ema: f64 = 0.0;
-    let mut slow_streak: u32 = 0;
+    let first_byte_timeout = ctx.options.watchdog_first_byte_timeout;
+    // 固定周期 tick：不能每轮 select 新建 `sleep(1s)`——数据持续到达时
+    // 另一分支总是先就绪，sleep 会被反复丢弃，看门狗永远不采样（旧实现的隐性 bug）。
+    let mut watchdog_tick = tokio::time::interval(Duration::from_secs(1));
+    watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    watchdog_tick.tick().await;
+    let mut smooth: f64 = 0.0;
+    let mut slow_since: Option<Instant> = None;
     let mut last_activity = Instant::now();
-    let mut prev_tick_bytes = seg.downloaded.load(Ordering::Relaxed);
+    let mut prev_tick_bytes = attempt_start_bytes;
 
     loop {
         tokio::select! {
@@ -969,7 +1204,7 @@ async fn try_segment_once(
                         }
                         let take = (bytes.len() as u64).min(remaining) as usize;
                         file.write_all(&bytes[..take]).await
-                            .map_err(|e| SegError::Retryable(e.to_string()))?;
+                            .map_err(|e| SegError::Retryable(format!("写 .part 失败: {e}")))?;
                         seg.downloaded.fetch_add(take as u64, Ordering::Relaxed);
                         ctx.stats.downloaded.fetch_add(take as u64, Ordering::Relaxed);
                         if let Some(l) = &ctx.limiter {
@@ -984,45 +1219,97 @@ async fn try_segment_once(
                         last_activity = Instant::now();
                     }
                     Some(Err(e)) => {
-                        return Err(SegError::Retryable(format!("网络中断: {e}")));
+                        return Err(SegError::Retryable(format!(
+                            "网络中断: {}",
+                            describe_reqwest_error(&e)
+                        )));
                     }
                     None => {
                         file.sync_data().await
-                            .map_err(|e| SegError::Retryable(e.to_string()))?;
+                            .map_err(|e| SegError::Retryable(format!("sync .part 失败: {e}")))?;
                         if seg.finished() {
                             ctx.mark_host_alive(&host_of(url));
                             return Ok(());
                         }
                         let got = seg.downloaded.load(Ordering::Relaxed);
                         return Err(SegError::Retryable(format!(
-                            "流提前结束: 已收 {} / 期望 {}",
+                            "流提前结束: 已收 {} / 期望 {}（url={url}）",
                             got,
                             seg.len()
                         )));
                     }
                 }
             }
-            _ = sleep(Duration::from_secs(1)) => {
-                if last_activity.elapsed() > idle_timeout {
-                    return Err(SegError::Retryable("看门狗: 无数据超过阈值".into()));
-                }
-                let inst =
-                    (seg.downloaded.load(Ordering::Relaxed).saturating_sub(prev_tick_bytes)) as f64;
-                prev_tick_bytes = seg.downloaded.load(Ordering::Relaxed);
-                if ema == 0.0 {
-                    ema = inst;
+            _ = watchdog_tick.tick() => {
+                let now = Instant::now();
+                let got = seg.downloaded.load(Ordering::Relaxed);
+                let received_this_attempt = got.saturating_sub(attempt_start_bytes);
+                let idle = now.duration_since(last_activity);
+                let inst = got.saturating_sub(prev_tick_bytes) as f64;
+                prev_tick_bytes = got;
+                smooth = if smooth == 0.0 {
+                    inst
                 } else {
-                    ema = ema * 0.8 + inst * 0.2;
-                }
-                if ema > 1024.0 && inst < ema * slow_factor {
-                    slow_streak += 1;
-                    if slow_streak >= slow_samples {
-                        return Err(SegError::Retryable(
-                            "看门狗: 速度持续低于平滑速度".into(),
-                        ));
+                    smooth * 0.8 + inst * 0.2
+                };
+                ctx.note_segment_speed(seg.index, inst);
+
+                let total = ctx.stats.total.load(Ordering::Relaxed);
+                let downloaded = ctx.stats.downloaded.load(Ordering::Relaxed);
+                let remaining = total.saturating_sub(downloaded);
+                let active = ctx.stats.active_segments.load(Ordering::Relaxed);
+                let peer = ctx.peer_median_speed(seg.index);
+                let snapshot = watchdog_snapshot(
+                    seg, url, from, got, inst, smooth, peer, active, remaining,
+                );
+
+                // L2 硬失败：首字节迟迟不来 / 已出过字节但断流超过 idle。
+                if received_this_attempt == 0 {
+                    if idle >= first_byte_timeout {
+                        return Err(SegError::Retryable(format!(
+                            "看门狗: 等待响应体首字节超时 {}s（{snapshot}）",
+                            first_byte_timeout.as_secs()
+                        )));
                     }
-                } else {
-                    slow_streak = 0;
+                } else if idle >= idle_timeout {
+                    return Err(SegError::Retryable(format!(
+                        "看门狗: 无数据超过 {}s（{snapshot}）",
+                        idle_timeout.as_secs()
+                    )));
+                }
+
+                // L1 软重启：只在末端阶段、且只相对「同批活跃段中位数」判断。
+                // 全程高并发阶段不因速度比例杀段；超限后由 run_segment 关闭该逻辑。
+                if allow_rebuild {
+                    let max_segments = ctx.task.max_segments.unwrap_or(ctx.options.max_segments);
+                    let end_stage = active < max_segments
+                        || remaining
+                            < ctx
+                                .options
+                                .segment_size
+                                .saturating_mul(ctx.options.watchdog_end_stage_factor);
+                    if attempt_started.elapsed() >= ctx.options.watchdog_rebuild_min_runtime
+                        && got >= ctx.options.watchdog_rebuild_min_bytes
+                        && end_stage
+                    {
+                        match peer {
+                            Some(peer_bps)
+                                if peer_bps > 1024.0
+                                    && smooth
+                                        < peer_bps * ctx.options.watchdog_rebuild_ratio =>
+                            {
+                                let since = *slow_since.get_or_insert(now);
+                                if now.duration_since(since)
+                                    >= ctx.options.watchdog_rebuild_slow_duration
+                                {
+                                    return Err(SegError::Rebuild(snapshot));
+                                }
+                            }
+                            _ => slow_since = None,
+                        }
+                    } else {
+                        slow_since = None;
+                    }
                 }
             }
         }
@@ -1047,13 +1334,21 @@ async fn try_streamed_once(
     )
     .await
     {
-        Ok(r) => r?,
+        Ok(r) => r.map_err(|e| {
+            DownloadError::Other(format!(
+                "等待响应头失败（{url}）: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?,
         Err(_) => {
-            return Err(DownloadError::Exhausted("等待响应头超时".into()));
+            return Err(DownloadError::Exhausted(format!(
+                "等待响应头超时 {}s（{url}）",
+                ctx.options.timeout.as_secs()
+            )));
         }
     };
     let status = resp.status();
-    ctx.log(LogLevel::Debug, format!("流式响应: {status}"));
+    ctx.log_task(LogLevel::Debug, format!("流式响应: {status} url={url}"));
     if !status.is_success() {
         let code = status.as_u16();
         if code == 429 {
@@ -1095,10 +1390,10 @@ async fn try_streamed_once(
         && !ctx.ranged_attempted.load(Ordering::Relaxed)
         && total.is_some_and(|t| t > ctx.options.split_threshold)
     {
-        ctx.log(
+        ctx.log_task(
             LogLevel::Info,
             format!(
-                "响应头判定为大文件（{} 字节）且支持 Range，改走分片",
+                "响应头判定为大文件（{} 字节）且支持 Range，改走分片: {url}",
                 total.unwrap_or(0)
             ),
         );
@@ -1117,13 +1412,20 @@ async fn try_streamed_once(
         .await?;
     let mut stream = resp.bytes_stream();
     let idle_timeout = ctx.options.watchdog_idle_timeout;
+    let first_byte_timeout = ctx.options.watchdog_first_byte_timeout;
+    let attempt_started = Instant::now();
+    let mut got_any = false;
     let mut last_activity = Instant::now();
+    let mut watchdog_tick = tokio::time::interval(Duration::from_secs(1));
+    watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    watchdog_tick.tick().await;
     loop {
         tokio::select! {
             _ = ctx.cancel.cancelled() => return Err(DownloadError::Cancelled),
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
+                        got_any = true;
                         file.write_all(&bytes).await?;
                         ctx.stats.downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         if let Some(l) = &ctx.limiter {
@@ -1131,7 +1433,12 @@ async fn try_streamed_once(
                         }
                         last_activity = Instant::now();
                     }
-                    Some(Err(e)) => return Err(DownloadError::Http(e)),
+                    Some(Err(e)) => {
+                        return Err(DownloadError::Other(format!(
+                            "流式网络中断（{url}）: {}",
+                            describe_reqwest_error(&e)
+                        )));
+                    }
                     None => {
                         file.sync_all().await?;
                         let total = ctx.stats.total.load(Ordering::Relaxed);
@@ -1156,11 +1463,20 @@ async fn try_streamed_once(
                     }
                 }
             }
-            _ = sleep(Duration::from_secs(1)) => {
-                if last_activity.elapsed() > idle_timeout {
-                    return Err(DownloadError::Exhausted(
-                        "看门狗: 流式下载无数据超过阈值".into(),
-                    ));
+            _ = watchdog_tick.tick() => {
+                // 流式路径没有分段冗余：只保留 idle 急救，绝不因「慢」中止。
+                if got_any {
+                    if last_activity.elapsed() >= idle_timeout {
+                        return Err(DownloadError::Exhausted(format!(
+                            "看门狗: 流式下载无数据超过 {}s（url={url}）",
+                            idle_timeout.as_secs()
+                        )));
+                    }
+                } else if attempt_started.elapsed() >= first_byte_timeout {
+                    return Err(DownloadError::Exhausted(format!(
+                        "看门狗: 流式响应体首字节超时 {}s（url={url}）",
+                        first_byte_timeout.as_secs()
+                    )));
                 }
             }
         }
@@ -1335,6 +1651,75 @@ fn backoff(opts: &DownloadOptions, attempt: u32) -> Duration {
     let base = opts.retry_base_delay.as_millis().max(1) as u64;
     let exp = base * (1u64 << attempt.min(6));
     Duration::from_millis(exp + rand::rng().random_range(0..=250))
+}
+
+/// 看门狗快照：把「真死 / 误杀 / 整体限速」区分开所需的全部字段。
+#[allow(clippy::too_many_arguments)]
+fn watchdog_snapshot(
+    seg: &Segment,
+    url: &str,
+    from: u64,
+    got: u64,
+    inst: f64,
+    smooth: f64,
+    peer: Option<f64>,
+    active: u32,
+    remaining: u64,
+) -> String {
+    let peer_text = peer.map(human_bps).unwrap_or_else(|| "n/a".to_string());
+    let ratio = peer.map_or(1.0, |p| if p > 0.0 { smooth / p } else { 1.0 });
+    format!(
+        "instant={} smooth={} peer_median={peer_text} ratio={ratio:.2} bytes={}/{} seg={}-{} from={} remaining={} active_segs={active} url={url}",
+        human_bps(inst),
+        human_bps(smooth),
+        human_bytes(got),
+        human_bytes(seg.len()),
+        seg.start,
+        seg.end,
+        from,
+        human_bytes(remaining),
+    )
+}
+
+fn human_bps(bps: f64) -> String {
+    if !bps.is_finite() || bps <= 0.0 {
+        return "0B/s".to_string();
+    }
+    format!("{}/s", human_bytes(bps as u64))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+/// reqwest 的 Display 通常只有「error sending request for url (...)」，
+/// 真正的 DNS/TLS/连接重置原因在 source 链里。把整条链拼出来，用户日志才有信息量。
+fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut out = error.to_string();
+    let mut source = error.source();
+    let mut depth = 0;
+    while let Some(cause) = source {
+        if depth >= 4 {
+            break;
+        }
+        out.push_str(" <- ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+        depth += 1;
+    }
+    out
 }
 
 fn content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
