@@ -12,6 +12,14 @@ pub enum DownloadError {
     #[error("HTTP 请求失败: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// HTTP 请求失败 + 业务上下文（URL/阶段），保留底层 reqwest 错误作为 source。
+    #[error("HTTP 请求失败（{context}）: {source}")]
+    HttpContext {
+        context: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// 服务器返回了非成功状态码。
     #[error("服务器返回错误状态 {status} (url: {url})")]
     HttpStatus { status: u16, url: String },

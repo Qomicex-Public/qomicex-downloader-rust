@@ -42,14 +42,24 @@ async fn main() {
 | `headers` | `[]` | 全局默认请求头（任务级同名覆盖） |
 | `timeout` | 60s | 单请求总超时 |
 | `connect_timeout` | 15s | 连接超时 |
-| `max_retries` | 5 | 分片级重试次数（耗尽后降级整文件） |
+| `max_retries` | 5 | 分片级重试次数（真错误才扣；耗尽后进入下一轮） |
 | `retry_base_delay` | 500ms | 重试退避基数（×2ⁿ + 抖动） |
 | `segment_size` | 8MB | 分片大小 |
 | `max_segments` | 16 | 任务内最大并发段数 |
+| `max_total_segments` | 64 | 全局段许可上限（跨任务） |
 | `split_threshold` | 10MB | 超过才分片，小文件直传 |
-| `watchdog_idle_timeout` | 30s | 无数据判卡死 |
-| `watchdog_slow_factor` | 0.3 | 龟速系数（低于平滑速度 ×0.3） |
-| `watchdog_slow_samples` | 5 | 连续低速采样次数 |
+| `watchdog_idle_timeout` | 60s | L2：已出字节后断流判失败 |
+| `watchdog_first_byte_timeout` | 20s | L2：等待响应体首字节超时 |
+| `watchdog_rebuild_min_runtime` | 10s | L1：段最短运行时间 |
+| `watchdog_rebuild_min_bytes` | 1MB | L1：段最少已收字节 |
+| `watchdog_rebuild_slow_duration` | 15s | L1：持续低速时长 |
+| `watchdog_rebuild_ratio` | 0.25 | L1：低于同批中位数 × 该系数 |
+| `watchdog_rebuild_limit` | 3 | L1：单段软重启上限 |
+| `watchdog_rebuild_cooldown` | 2s | L1：软重启冷却 |
+| `watchdog_end_stage_factor` | 2 | 剩余 < segment_size × 该值视为末端 |
+| `segment_rounds` | 3 | 单段完整重试轮数 |
+| `watchdog_slow_factor` | 0.3 | 兼容字段，已由 `watchdog_rebuild_ratio` 取代 |
+| `watchdog_slow_samples` | 5 | 兼容字段，已由 `watchdog_rebuild_slow_duration` 取代 |
 | `split_sample_interval` | 2s | 动态拆分检查周期 |
 | `progress_throttle` | 150ms | 任务级进度事件节流 |
 | `global_progress_interval` | 250ms | 全局进度聚合周期 |
@@ -89,6 +99,7 @@ Log { level: LogLevel, message }                                   // Debug/Info
 | `cancel` | `async (id) -> Result<()>` | 取消（删除 .part） |
 | `remove` | `async (id) -> Result<()>` | 取消并清理条目 |
 | `state` | `async (id) -> Result<TaskState>` | 查询状态 |
+| `last_error` | `async (id) -> Option<String>` | 查询最近一次失败原因（广播事件丢失时轮询兜底） |
 | `list` | `async () -> Vec<(TaskId, TaskState)>` | 任务列表 |
 | `shutdown` | `async ()` | 取消全部任务并等待退出 |
 
@@ -146,6 +157,7 @@ DownloadTask::new(url, dest)
 | `cancel` | `async (id) -> Result<()>` | 取消（删除 .part） |
 | `remove` | `async (id) -> Result<()>` | 取消并清理条目 |
 | `state` | `async (id) -> Result<TaskState>` | 查询状态 |
+| `last_error` | `async (id) -> Option<String>` | 查询最近一次失败原因（广播事件丢失时轮询兜底） |
 | `list` | `async () -> Vec<(TaskId, TaskState)>` | 任务列表 |
 | `shutdown` | `async ()` | 取消全部任务并等待退出 |
 

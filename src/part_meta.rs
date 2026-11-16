@@ -140,6 +140,8 @@ impl PartMeta {
         }
         let tmp = meta_tmp_path(path);
         tokio::fs::write(&tmp, text.as_bytes()).await?;
+        // Windows 上 rename 不能覆盖已存在的 sidecar：先删旧文件再原子替换。
+        let _ = tokio::fs::remove_file(path).await;
         tokio::fs::rename(&tmp, path).await
     }
 }

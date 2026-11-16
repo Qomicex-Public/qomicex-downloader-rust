@@ -42,6 +42,9 @@ pub struct Behavior {
     pub stall: Option<Duration>,
     /// `/throttle` 慢/快连接速率（bps），慢=连接1，快=后续。
     pub throttle: Option<(u64, u64)>,
+    /// `/throttle` 的第一个连接是流式嗅探（只读响应头就丢弃），把它算作慢连接
+    /// 会让真正的分段连接全部变快。置 true 时跳过第 0 个连接，从第 1 个开始慢。
+    pub throttle_skip_first: bool,
     /// `/status404` 恒返回 404。
     pub status404: bool,
     /// 206 响应的 `Content-Range` 始终从 0 开始（与请求区间不符），
@@ -284,7 +287,8 @@ async fn handle_conn(
 
     if let Some((slow, fast)) = behavior.throttle {
         let conn = conn_count.fetch_add(1, Ordering::Relaxed);
-        let rate = if conn == 0 { slow } else { fast };
+        let slow_conn = if behavior.throttle_skip_first { 1 } else { 0 };
+        let rate = if conn == slow_conn { slow } else { fast };
         let block = 8 * 1024u64;
         let delay = Duration::from_secs_f64(block as f64 / rate as f64);
         let total = data.len() as u64;
