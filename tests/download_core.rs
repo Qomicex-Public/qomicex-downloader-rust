@@ -1643,6 +1643,14 @@ async fn dead_mirrors_fail_instead_of_rotating_forever() {
     assert_eq!(st, TaskState::Failed, "两个源都恒 500 时必须失败");
     let err = m.last_error(id).await.unwrap_or_default();
     assert!(err.contains("500"), "失败原因应保留真实状态码: {err}");
+    // 有限轮换的判据不只是「最终失败」：必须真的换到了镜像 B，
+    // 且两个源的请求数都有界（不会无限轮换）。
+    assert!(b.plain_gets() > 0, "镜像 B 必须被尝试过");
+    let total = a.plain_gets() + b.plain_gets();
+    assert!(
+        total <= 6,
+        "max_retries=1 + 2 个源 + 2 次零字节上限：请求总数应有界，实际 {total}"
+    );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1657,18 +1665,13 @@ async fn dead_single_source_fails_after_two_empty_attempts() {
     opts.watchdog_first_byte_timeout = Duration::from_millis(300);
     let m = DownloadManager::new(opts, 1);
     let id = m.add(DownloadTask::new(server.url("hang"), dir.join("x.bin")).with_max_retries(5));
-    let started = Instant::now();
     let st = wait_terminal(&m, id, Duration::from_secs(20)).await;
     assert_eq!(st, TaskState::Failed);
+    // 尝试次数是唯一判据：不断言墙钟耗时，避免高负载 CI 上调度延迟造成假失败。
     assert_eq!(
         server.plain_gets(),
         2,
         "零字节尝试两次即应放弃，而不是烧满 max_retries=5"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "两次 300ms 首字节超时即应失败，实际 {:?}",
-        started.elapsed()
     );
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

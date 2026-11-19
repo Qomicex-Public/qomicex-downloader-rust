@@ -52,18 +52,26 @@ async fn run_phase(label: &str, http1: bool, concurrency: usize) {
         let mut first_byte_stalls = 0u32;
         let mut mirror_switches = 0u32;
         let mut retries = 0u32;
-        while let Ok(ev) = rx.recv().await {
-            if let DownloadEvent::Log { message, .. } = ev {
-                if message.contains("首字节超时") {
-                    first_byte_stalls += 1;
-                } else if message.contains("切换镜像") {
-                    mirror_switches += 1;
-                } else if message.contains("次重试") {
-                    retries += 1;
+        let mut lagged = 0u64;
+        loop {
+            match rx.recv().await {
+                Ok(DownloadEvent::Log { message, .. }) => {
+                    if message.contains("首字节超时") {
+                        first_byte_stalls += 1;
+                    } else if message.contains("切换镜像") {
+                        mirror_switches += 1;
+                    } else if message.contains("次重试") {
+                        retries += 1;
+                    }
                 }
+                Ok(_) => {}
+                // 落后不等于结束：广播缓冲区被覆盖只丢一部分日志，必须继续收，
+                // 并把丢弃数量报出来，否则会把不完整计数当完整结果。
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => lagged += n,
+                Err(_) => break,
             }
         }
-        (first_byte_stalls, mirror_switches, retries)
+        (first_byte_stalls, mirror_switches, retries, lagged)
     });
     let mut ids = Vec::new();
     for (i, url) in URLS.iter().enumerate() {
@@ -92,13 +100,13 @@ async fn run_phase(label: &str, http1: bool, concurrency: usize) {
     mgr.shutdown().await;
     // 先丢 manager（关掉事件 sender），否则 rx.recv() 永远等不到 Closed，logger.await 死等。
     drop(mgr);
-    let (stalls, switches, retries) =
+    let (stalls, switches, retries, lagged) =
         match tokio::time::timeout(Duration::from_secs(5), logger).await {
             Ok(Ok(v)) => v,
-            _ => (0, 0, 0),
+            _ => (0, 0, 0, 0),
         };
     println!(
-        "[{label}] http1={http1} 并发={concurrency} 完成={done} 失败={failed} 耗时={elapsed:.1?} 首字节超时={stalls} 换源={switches} 重试={retries}"
+        "[{label}] http1={http1} 并发={concurrency} 完成={done} 失败={failed} 耗时={elapsed:.1?} 首字节超时={stalls} 换源={switches} 重试={retries} 事件丢弃={lagged}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
