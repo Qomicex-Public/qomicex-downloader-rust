@@ -365,6 +365,31 @@ where
     }
 }
 
+/// 有限轮换镜像：每个 URL 至多成为一次「当前源」。
+///
+/// 旧实现换源时把 attempt 清零、轮换本身没有预算：≥2 个 URL 时持续失败的文件会
+/// 无限轮换、永远不进入 Failed，只能等上层批次看门狗把整个安装判超时（issue #366）。
+///
+/// 按**已尝试的 URL 集合**而非轮换次数计数：分段并发换源时共享的 URL 列表会被
+/// 其他段推进，按次数计会让本段重复尝试同一 URL、在碰到健康镜像前耗尽预算。
+/// 返回 None 表示所有源都已试过，调用方应走正常失败路径。
+fn next_mirror(
+    ctx: &Arc<RunContext>,
+    tried: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    let count = ctx.urls.lock().unwrap().len();
+    if tried.len() >= count {
+        return None;
+    }
+    for _ in 0..count {
+        let next = ctx.mirror_url()?;
+        if tried.insert(next.clone()) {
+            return Some(next);
+        }
+    }
+    None
+}
+
 pub(crate) struct Engine;
 
 /// 段失败类别。
@@ -383,8 +408,12 @@ type SegmentOutcome = (u32, Result<(), SegFailure>);
 #[derive(Debug)]
 enum SegError {
     Cancelled,
-    /// 真错误：扣 `max_retries` 预算。
-    Retryable(String),
+    /// 真错误：扣 `max_retries` 预算。`timeout` 标记「零字节 + 超时」类失败，
+    /// 供无镜像可换时的快速失败判定；429/5xx 等瞬态错误不受其影响。
+    Retryable {
+        reason: String,
+        timeout: bool,
+    },
     /// L1 软重启：慢速但有进展，不扣重试预算，重新入队/重开连接。
     Rebuild(String),
     /// 非瞬态错误（4xx，除 408/429）：重试同一源没有意义，立即换镜像。
@@ -839,6 +868,8 @@ impl Engine {
             let max_retries = ctx.task.max_retries.unwrap_or(opts.max_retries);
             let mut attempt: u32 = 0;
             let mut url = ctx.current_url();
+            let mut tried: std::collections::HashSet<String> =
+                std::collections::HashSet::from([url.clone()]);
             loop {
                 if ctx.cancel.is_cancelled() {
                     return Err(DownloadError::Cancelled);
@@ -877,22 +908,27 @@ impl Engine {
                             }
                             _ => false,
                         };
-                        if fatal_status && ctx.has_other_url() {
-                            if let Some(next) = ctx.mirror_url() {
-                                attempt = 0;
-                                url = next;
-                                ctx.log_task(
-                                    LogLevel::Warn,
-                                    format!("非瞬态错误（{e}），立即切换镜像 {url}"),
-                                );
-                                continue;
+                        if fatal_status {
+                            match next_mirror(ctx, &mut tried) {
+                                Some(next) => {
+                                    attempt = 0;
+                                    url = next;
+                                    ctx.log_task(
+                                        LogLevel::Warn,
+                                        format!("非瞬态错误（{e}），立即切换镜像 {url}"),
+                                    );
+                                    continue;
+                                }
+                                // 4xx 是确定性失败：没有镜像可换就直接失败，
+                                // 不再对同一源空转 max_retries 次。
+                                None => return Err(e),
                             }
                         }
                         // 流式路径每次尝试都从头写，换源没有续传代价：已经收到过字节
                         // 但看门狗再次超时时也换源，避免在同一坏节点上耗完整个重试预算。
                         let stalled = matches!(e, DownloadError::Exhausted(_));
                         if stalled && ctx.has_other_url() {
-                            if let Some(next) = ctx.mirror_url() {
+                            if let Some(next) = next_mirror(ctx, &mut tried) {
                                 attempt = 0;
                                 url = next;
                                 ctx.log_task(LogLevel::Warn, format!("连续无进展，切换镜像 {url}"));
@@ -903,7 +939,7 @@ impl Engine {
                             ctx.mark_source_dead(&url);
                         }
                         if !got_bytes && ctx.has_other_url() {
-                            if let Some(next) = ctx.mirror_url() {
+                            if let Some(next) = next_mirror(ctx, &mut tried) {
                                 attempt = 0;
                                 url = next;
                                 ctx.log_task(
@@ -915,7 +951,7 @@ impl Engine {
                         }
                         attempt += 1;
                         if attempt > max_retries {
-                            match ctx.mirror_url() {
+                            match next_mirror(ctx, &mut tried) {
                                 Some(next) => {
                                     attempt = 0;
                                     url = next;
@@ -927,6 +963,16 @@ impl Engine {
                                 }
                                 None => return Err(e),
                             }
+                        }
+                        // 连续两次零字节且是超时类失败：源已死、又没有镜像可换，
+                        // 继续烧满重试预算只是白等（issue #366 日志里同一 URL
+                        // 连续 5 次首字节超时、单文件白等约 2.5 分钟）。
+                        if !got_bytes && stalled && attempt >= 2 {
+                            ctx.log_task(
+                                LogLevel::Warn,
+                                format!("连续 {attempt} 次无数据且无镜像可换，放弃该文件: {url}"),
+                            );
+                            return Err(e);
                         }
                         let delay = backoff(opts, attempt);
                         ctx.log_task(
@@ -954,6 +1000,8 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
     let max_retries = ctx.task.max_retries.unwrap_or(ctx.options.max_retries);
     let mut attempt: u32 = 0;
     let mut attempt_url = ctx.current_url();
+    let mut tried: std::collections::HashSet<String> =
+        std::collections::HashSet::from([attempt_url.clone()]);
     // L1 软重启预算：与 max_retries 完全独立，超限后不再杀段，只保留 idle 超时。
     let mut rebuilds: u32 = 0;
     let mut allow_rebuild = true;
@@ -961,6 +1009,7 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
         if ctx.cancel.is_cancelled() {
             return (idx, Err(SegFailure::Cancelled));
         }
+        let attempt_start_bytes = seg.downloaded.load(Ordering::Relaxed);
         match try_segment_once(&ctx, &mut seg, &attempt_url, allow_rebuild).await {
             Ok(()) => return (idx, Ok(())),
             Err(SegError::Cancelled) => return (idx, Err(SegFailure::Cancelled)),
@@ -995,7 +1044,7 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
             Err(SegError::Fatal(reason)) => {
                 ctx.record_error(format!("seg {idx} url={attempt_url}: {reason}"));
                 // 4xx（非 408/429）：该源这条路径不存在/无权限，重试同一源只是空转。
-                if let Some(next) = ctx.mirror_url() {
+                if let Some(next) = next_mirror(&ctx, &mut tried) {
                     attempt = 0;
                     attempt_url = next;
                     ctx.log_task(
@@ -1025,30 +1074,29 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                 );
                 return (idx, Err(SegFailure::RangeInvalid(reason)));
             }
-            Err(SegError::Retryable(reason)) => {
+            Err(SegError::Retryable { reason, timeout }) => {
                 ctx.record_error(format!(
                     "seg {idx} url={attempt_url} attempt={attempt}: {reason}"
                 ));
                 // 快速失败：这一段在本源上一个字节都没拿到 → 源是死的，立刻换源，
-                // 不在同一源上耗尽重试预算。
-                let progressed = seg.downloaded.load(Ordering::Relaxed) > 0;
+                // 不在同一源上耗尽重试预算。判定按**本次尝试**的字节数：
+                // 段之前已下/续传过字节不代表本次尝试有进展。
+                let progressed = seg.downloaded.load(Ordering::Relaxed) > attempt_start_bytes;
                 if !progressed {
                     ctx.mark_source_dead(&attempt_url);
-                    if ctx.has_other_url() {
-                        if let Some(next) = ctx.mirror_url() {
-                            attempt = 0;
-                            attempt_url = next;
-                            ctx.log_task(
-                                LogLevel::Warn,
-                                format!("段 {idx}: 源无响应，立即切换镜像 {attempt_url}"),
-                            );
-                            continue;
-                        }
+                    if let Some(next) = next_mirror(&ctx, &mut tried) {
+                        attempt = 0;
+                        attempt_url = next;
+                        ctx.log_task(
+                            LogLevel::Warn,
+                            format!("段 {idx}: 源无响应，立即切换镜像 {attempt_url}"),
+                        );
+                        continue;
                     }
                 }
                 attempt += 1;
                 if attempt > max_retries {
-                    match ctx.mirror_url() {
+                    match next_mirror(&ctx, &mut tried) {
                         Some(next) => {
                             attempt = 0;
                             attempt_url = next;
@@ -1060,6 +1108,11 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                         }
                         None => return (idx, Err(SegFailure::Exhausted(reason))),
                     }
+                }
+                // 与流式路径同口径：连续零字节且为超时类失败、没有镜像可换时
+                // 快速失败。429/5xx 等瞬态错误不受此限，照常用满重试预算。
+                if timeout && !progressed && attempt >= 2 {
+                    return (idx, Err(SegFailure::Exhausted(reason)));
                 }
                 let delay = backoff(&ctx.options, attempt);
                 ctx.log_task(
@@ -1103,12 +1156,18 @@ async fn try_segment_once(
         .header(reqwest::header::RANGE, range.clone())
         .send();
     let resp = match tokio::time::timeout(ctx.options.timeout, send).await {
-        Ok(r) => r.map_err(|e| SegError::Retryable(describe_reqwest_error(&e)))?,
+        Ok(r) => r.map_err(|e| SegError::Retryable {
+            reason: describe_reqwest_error(&e),
+            timeout: e.is_timeout(),
+        })?,
         Err(_) => {
-            return Err(SegError::Retryable(format!(
-                "等待响应头超时 {}s（{url}，range={range}）",
-                ctx.options.timeout.as_secs()
-            )))
+            return Err(SegError::Retryable {
+                reason: format!(
+                    "等待响应头超时 {}s（{url}，range={range}）",
+                    ctx.options.timeout.as_secs()
+                ),
+                timeout: true,
+            })
         }
     };
     let status = resp.status();
@@ -1147,7 +1206,10 @@ async fn try_segment_once(
         }
         let msg = format!("HTTP {status} ({url})");
         if is_retryable_status(code) {
-            return Err(SegError::Retryable(msg));
+            return Err(SegError::Retryable {
+                reason: msg,
+                timeout: false,
+            });
         }
         return Err(SegError::Fatal(msg));
     }
@@ -1183,12 +1245,16 @@ async fn try_segment_once(
         .truncate(false) // 断点续传：不截断已有 .part
         .open(&ctx.task.part_path())
         .await
-        .map_err(|e| {
-            SegError::Retryable(format!("打开 .part {:?} 失败: {e}", ctx.task.part_path()))
+        .map_err(|e| SegError::Retryable {
+            reason: format!("打开 .part {:?} 失败: {e}", ctx.task.part_path()),
+            timeout: false,
         })?;
     file.seek(tokio::io::SeekFrom::Start(from))
         .await
-        .map_err(|e| SegError::Retryable(e.to_string()))?;
+        .map_err(|e| SegError::Retryable {
+            reason: e.to_string(),
+            timeout: false,
+        })?;
 
     let mut stream = resp.bytes_stream();
     let idle_timeout = ctx.options.watchdog_idle_timeout;
@@ -1203,6 +1269,11 @@ async fn try_segment_once(
     let mut last_activity = Instant::now();
     let mut prev_tick_bytes = attempt_start_bytes;
 
+    // 本次尝试无数据即失败的统一出口：附带 timeout 标记，供快速失败判定。
+    let stalled = |reason: String| SegError::Retryable {
+        reason,
+        timeout: true,
+    };
     loop {
         tokio::select! {
             _ = ctx.cancel.cancelled() => return Err(SegError::Cancelled),
@@ -1213,39 +1284,49 @@ async fn try_segment_once(
                         let remaining =
                             seg.len().saturating_sub(seg.downloaded.load(Ordering::Relaxed));
                         if remaining == 0 {
-                            return Err(SegError::Retryable("响应体超出段范围".into()));
+                            return Err(SegError::Retryable {
+                                reason: "响应体超出段范围".into(),
+                                timeout: false,
+                            });
                         }
                         let take = (bytes.len() as u64).min(remaining) as usize;
                         file.write_all(&bytes[..take]).await
-                            .map_err(|e| SegError::Retryable(format!("写 .part 失败: {e}")))?;
+                            .map_err(|e| SegError::Retryable {
+                                reason: format!("写 .part 失败: {e}"),
+                                timeout: false,
+                            })?;
                         seg.downloaded.fetch_add(take as u64, Ordering::Relaxed);
                         ctx.stats.downloaded.fetch_add(take as u64, Ordering::Relaxed);
                         if let Some(l) = &ctx.limiter {
                             l.acquire(take as u64).await;
                         }
                         if take < bytes.len() {
-                            return Err(SegError::Retryable(format!(
-                                "响应体超出段范围: 段剩余 {remaining} 字节，收到 {} 字节",
-                                bytes.len()
-                            )));
+                            return Err(SegError::Retryable {
+                                reason: format!(
+                                    "响应体超出段范围: 段剩余 {remaining} 字节，收到 {} 字节",
+                                    bytes.len()
+                                ),
+                                timeout: false,
+                            });
                         }
                         last_activity = Instant::now();
                     }
                     Some(Err(e)) => {
-                        return Err(SegError::Retryable(format!(
-                            "网络中断: {}",
-                            describe_reqwest_error(&e)
-                        )));
+                        let reason = format!("网络中断: {}", describe_reqwest_error(&e));
+                        return Err(stalled(reason));
                     }
                     None => {
                         file.sync_data().await
-                            .map_err(|e| SegError::Retryable(format!("sync .part 失败: {e}")))?;
+                            .map_err(|e| SegError::Retryable {
+                                reason: format!("sync .part 失败: {e}"),
+                                timeout: false,
+                            })?;
                         if seg.finished() {
                             ctx.mark_host_alive(&host_of(url));
                             return Ok(());
                         }
                         let got = seg.downloaded.load(Ordering::Relaxed);
-                        return Err(SegError::Retryable(format!(
+                        return Err(stalled(format!(
                             "流提前结束: 已收 {} / 期望 {}（url={url}）",
                             got,
                             seg.len()
@@ -1279,13 +1360,13 @@ async fn try_segment_once(
                 // L2 硬失败：首字节迟迟不来 / 已出过字节但断流超过 idle。
                 if received_this_attempt == 0 {
                     if idle >= first_byte_timeout {
-                        return Err(SegError::Retryable(format!(
+                        return Err(stalled(format!(
                             "看门狗: 等待响应体首字节超时 {}s（{snapshot}）",
                             first_byte_timeout.as_secs()
                         )));
                     }
                 } else if idle >= idle_timeout {
-                    return Err(SegError::Retryable(format!(
+                    return Err(stalled(format!(
                         "看门狗: 无数据超过 {}s（{snapshot}）",
                         idle_timeout.as_secs()
                     )));

@@ -1610,3 +1610,69 @@ async fn http_429_honors_retry_after() {
     m.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// issue #366：所有镜像都持续失败时必须进入 Failed，不能无限轮换。
+/// 旧实现换源即清零 attempt，≥2 个 URL 时文件永不失败，只能等上层批次看门狗
+/// 把整个安装判成「下载超时」。
+#[tokio::test]
+async fn dead_mirrors_fail_instead_of_rotating_forever() {
+    let a = MockServer::start(
+        1024,
+        Behavior {
+            flaky: Some(u32::MAX),
+            ..Default::default()
+        },
+    )
+    .await;
+    let b = MockServer::start(
+        1024,
+        Behavior {
+            flaky: Some(u32::MAX),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dir = tmp_dir("dead-mirrors");
+    let m = DownloadManager::new(fast_opts(), 1);
+    let id = m.add(
+        DownloadTask::new(a.url("flaky"), dir.join("x.bin"))
+            .with_mirrors([b.url("flaky")])
+            .with_max_retries(1),
+    );
+    let st = wait_terminal(&m, id, Duration::from_secs(30)).await;
+    assert_eq!(st, TaskState::Failed, "两个源都恒 500 时必须失败");
+    let err = m.last_error(id).await.unwrap_or_default();
+    assert!(err.contains("500"), "失败原因应保留真实状态码: {err}");
+    // 有限轮换的判据不只是「最终失败」：必须真的换到了镜像 B，
+    // 且两个源的请求数都有界（不会无限轮换）。
+    assert!(b.plain_gets() > 0, "镜像 B 必须被尝试过");
+    let total = a.plain_gets() + b.plain_gets();
+    assert!(
+        total <= 6,
+        "max_retries=1 + 2 个源 + 2 次零字节上限：请求总数应有界，实际 {total}"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// issue #366：死源（响应头给了、body 永远不来）且没有镜像可换时，
+/// 两次零字节尝试即失败，不在同一 URL 上白等完整重试预算。
+#[tokio::test]
+async fn dead_single_source_fails_after_two_empty_attempts() {
+    let server = MockServer::start(1024, Behavior::default()).await;
+    let dir = tmp_dir("dead-single");
+    let mut opts = fast_opts();
+    opts.watchdog_first_byte_timeout = Duration::from_millis(300);
+    let m = DownloadManager::new(opts, 1);
+    let id = m.add(DownloadTask::new(server.url("hang"), dir.join("x.bin")).with_max_retries(5));
+    let st = wait_terminal(&m, id, Duration::from_secs(20)).await;
+    assert_eq!(st, TaskState::Failed);
+    // 尝试次数是唯一判据：不断言墙钟耗时，避免高负载 CI 上调度延迟造成假失败。
+    assert_eq!(
+        server.plain_gets(),
+        2,
+        "零字节尝试两次即应放弃，而不是烧满 max_retries=5"
+    );
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

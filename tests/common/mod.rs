@@ -240,6 +240,19 @@ async fn handle_conn(
         )
         .await;
     }
+    if path == "/hang" {
+        // 回了响应头但 body 永远不来：模拟死节点（issue #366 首字节超时场景）。
+        write_response(
+            &mut stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n".as_bytes(),
+            &[],
+            None,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        return Ok(());
+    }
+
     if path == "/flaky" && method == "GET" {
         let count = flaky_count.fetch_add(1, Ordering::Relaxed);
         if count < behavior.flaky.unwrap_or(0) {
