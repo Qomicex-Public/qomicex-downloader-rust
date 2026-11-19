@@ -412,8 +412,12 @@ fn build_clients(
         .pool_max_idle_per_host(max_concurrent.clamp(1, 32))
         .user_agent(&options.user_agent)
         .http2_adaptive_window(true)
-        // 大帧需合法（上限 2^24-1=16_777_215）。激进 h2 配置是非限速源实测最优。
-        .http2_max_frame_size((16 * 1024 * 1024) - 1)
+        // 大帧合法上限为 2^24-1，但 h2 的 LengthDelimitedCodec 必须收满**整个**
+        // DATA 帧才把字节交给 body 流：16MB 帧在慢/拥塞链路上会把 body 首字节
+        // 延迟拉到十几秒，触发 20s 首字节看门狗（issue #366 日志里两个不同 host
+        // 同时成片首字节超时）。256KB 把最坏首字节延迟压到亚秒~数秒级，帧头
+        // 开销占比仍可忽略（<0.004%）。
+        .http2_max_frame_size((256 * 1024) - 1)
         .tcp_keepalive(Some(Duration::from_secs(30)));
     let h2 = apply_proxy_and_tls(with_resolver(h2_builder), options)
         .build()

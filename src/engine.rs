@@ -365,6 +365,21 @@ where
     }
 }
 
+/// 有限轮换镜像：每个 URL 至多成为一次「当前源」。
+///
+/// 旧实现换源时把 attempt 清零、轮换本身没有预算：≥2 个 URL 时持续失败的文件会
+/// 无限轮换、永远不进入 Failed，只能等上层批次看门狗把整个安装判超时（issue #366）。
+/// 返回 None 表示所有源都已当过当前源，调用方应走正常失败路径。
+fn next_mirror(ctx: &Arc<RunContext>, rotations: &mut u32) -> Option<String> {
+    let count = ctx.urls.lock().unwrap().len() as u32;
+    if *rotations + 1 >= count {
+        return None;
+    }
+    let next = ctx.mirror_url()?;
+    *rotations += 1;
+    Some(next)
+}
+
 pub(crate) struct Engine;
 
 /// 段失败类别。
@@ -838,6 +853,7 @@ impl Engine {
             let opts = &ctx.options;
             let max_retries = ctx.task.max_retries.unwrap_or(opts.max_retries);
             let mut attempt: u32 = 0;
+            let mut rotations: u32 = 0;
             let mut url = ctx.current_url();
             loop {
                 if ctx.cancel.is_cancelled() {
@@ -878,7 +894,7 @@ impl Engine {
                             _ => false,
                         };
                         if fatal_status && ctx.has_other_url() {
-                            if let Some(next) = ctx.mirror_url() {
+                            if let Some(next) = next_mirror(ctx, &mut rotations) {
                                 attempt = 0;
                                 url = next;
                                 ctx.log_task(
@@ -892,7 +908,7 @@ impl Engine {
                         // 但看门狗再次超时时也换源，避免在同一坏节点上耗完整个重试预算。
                         let stalled = matches!(e, DownloadError::Exhausted(_));
                         if stalled && ctx.has_other_url() {
-                            if let Some(next) = ctx.mirror_url() {
+                            if let Some(next) = next_mirror(ctx, &mut rotations) {
                                 attempt = 0;
                                 url = next;
                                 ctx.log_task(LogLevel::Warn, format!("连续无进展，切换镜像 {url}"));
@@ -903,7 +919,7 @@ impl Engine {
                             ctx.mark_source_dead(&url);
                         }
                         if !got_bytes && ctx.has_other_url() {
-                            if let Some(next) = ctx.mirror_url() {
+                            if let Some(next) = next_mirror(ctx, &mut rotations) {
                                 attempt = 0;
                                 url = next;
                                 ctx.log_task(
@@ -915,7 +931,7 @@ impl Engine {
                         }
                         attempt += 1;
                         if attempt > max_retries {
-                            match ctx.mirror_url() {
+                            match next_mirror(ctx, &mut rotations) {
                                 Some(next) => {
                                     attempt = 0;
                                     url = next;
@@ -927,6 +943,16 @@ impl Engine {
                                 }
                                 None => return Err(e),
                             }
+                        }
+                        // 连续两次零字节且是超时类失败：源已死、又没有镜像可换，
+                        // 继续烧满重试预算只是白等（issue #366 日志里同一 URL
+                        // 连续 5 次首字节超时、单文件白等约 2.5 分钟）。
+                        if !got_bytes && stalled && attempt >= 2 {
+                            ctx.log_task(
+                                LogLevel::Warn,
+                                format!("连续 {attempt} 次无数据且无镜像可换，放弃该文件: {url}"),
+                            );
+                            return Err(e);
                         }
                         let delay = backoff(opts, attempt);
                         ctx.log_task(
@@ -953,6 +979,7 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
     let idx = seg.index;
     let max_retries = ctx.task.max_retries.unwrap_or(ctx.options.max_retries);
     let mut attempt: u32 = 0;
+    let mut rotations: u32 = 0;
     let mut attempt_url = ctx.current_url();
     // L1 软重启预算：与 max_retries 完全独立，超限后不再杀段，只保留 idle 超时。
     let mut rebuilds: u32 = 0;
@@ -995,7 +1022,7 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
             Err(SegError::Fatal(reason)) => {
                 ctx.record_error(format!("seg {idx} url={attempt_url}: {reason}"));
                 // 4xx（非 408/429）：该源这条路径不存在/无权限，重试同一源只是空转。
-                if let Some(next) = ctx.mirror_url() {
+                if let Some(next) = next_mirror(&ctx, &mut rotations) {
                     attempt = 0;
                     attempt_url = next;
                     ctx.log_task(
@@ -1034,21 +1061,19 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                 let progressed = seg.downloaded.load(Ordering::Relaxed) > 0;
                 if !progressed {
                     ctx.mark_source_dead(&attempt_url);
-                    if ctx.has_other_url() {
-                        if let Some(next) = ctx.mirror_url() {
-                            attempt = 0;
-                            attempt_url = next;
-                            ctx.log_task(
-                                LogLevel::Warn,
-                                format!("段 {idx}: 源无响应，立即切换镜像 {attempt_url}"),
-                            );
-                            continue;
-                        }
+                    if let Some(next) = next_mirror(&ctx, &mut rotations) {
+                        attempt = 0;
+                        attempt_url = next;
+                        ctx.log_task(
+                            LogLevel::Warn,
+                            format!("段 {idx}: 源无响应，立即切换镜像 {attempt_url}"),
+                        );
+                        continue;
                     }
                 }
                 attempt += 1;
                 if attempt > max_retries {
-                    match ctx.mirror_url() {
+                    match next_mirror(&ctx, &mut rotations) {
                         Some(next) => {
                             attempt = 0;
                             attempt_url = next;
@@ -1060,6 +1085,11 @@ async fn run_segment(ctx: Arc<RunContext>, mut seg: Segment) -> SegmentOutcome {
                         }
                         None => return (idx, Err(SegFailure::Exhausted(reason))),
                     }
+                }
+                // 与流式路径同口径：连续零字节且没有镜像可换时快速失败，
+                // 不在死源上白等完整重试预算（issue #366）。
+                if !progressed && attempt >= 2 {
+                    return (idx, Err(SegFailure::Exhausted(reason)));
                 }
                 let delay = backoff(&ctx.options, attempt);
                 ctx.log_task(
